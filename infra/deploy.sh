@@ -61,6 +61,42 @@ provision() {
     --role "Key Vault Secrets Officer" --scope "$vault_id" -o none ||
     echo "WARNING: could not give you Key Vault Secrets Officer (already assigned?)" >&2
 
+  log "Storage through the managed identity (no account keys)"
+  # The app reaches its host and deployment storage as itself, so no storage
+  # key sits in app settings, and shared-key access is turned off entirely.
+  local storage_id
+  storage_id=$(az storage account show "${SUB[@]}" -g "$RESOURCE_GROUP" -n "$STORAGE_ACCOUNT" --query id -o tsv)
+  az role assignment create "${SUB[@]}" --assignee-object-id "$app_principal" --assignee-principal-type ServicePrincipal \
+    --role "Storage Blob Data Owner" --scope "$storage_id" -o none ||
+    echo "WARNING: could not give the app Storage Blob Data Owner (already assigned?)" >&2
+  az functionapp config appsettings set "${SUB[@]}" -g "$RESOURCE_GROUP" -n "$FUNCTION_APP" -o none \
+    --settings "AzureWebJobsStorage__accountName=$STORAGE_ACCOUNT"
+  az functionapp deployment config set "${SUB[@]}" -g "$RESOURCE_GROUP" -n "$FUNCTION_APP" \
+    --deployment-storage-auth-type SystemAssignedIdentity -o none
+  az functionapp config appsettings delete "${SUB[@]}" -g "$RESOURCE_GROUP" -n "$FUNCTION_APP" -o none \
+    --setting-names AzureWebJobsStorage DEPLOYMENT_STORAGE_CONNECTION_STRING
+  az storage account update "${SUB[@]}" -g "$RESOURCE_GROUP" -n "$STORAGE_ACCOUNT" --allow-shared-key-access false -o none
+
+  log "Logs: workspace $LOG_WORKSPACE, capped at $LOG_DAILY_CAP_GB GB/day"
+  # Its own workspace in this resource group, so the daily cap bounds what a
+  # flood of requests can cost and the budget below covers it.
+  local ws_id
+  az monitor log-analytics workspace show "${SUB[@]}" -g "$RESOURCE_GROUP" -n "$LOG_WORKSPACE" -o none 2>/dev/null ||
+    az monitor log-analytics workspace create "${SUB[@]}" -g "$RESOURCE_GROUP" -n "$LOG_WORKSPACE" -l "$LOCATION" -o none
+  az monitor log-analytics workspace update "${SUB[@]}" -g "$RESOURCE_GROUP" -n "$LOG_WORKSPACE" \
+    --quota "$LOG_DAILY_CAP_GB" --retention-time 30 -o none
+  ws_id=$(az monitor log-analytics workspace show "${SUB[@]}" -g "$RESOURCE_GROUP" -n "$LOG_WORKSPACE" --query id -o tsv)
+  if az monitor app-insights component show "${SUB[@]}" -g "$RESOURCE_GROUP" --app "$FUNCTION_APP" -o none 2>/dev/null; then
+    az monitor app-insights component update "${SUB[@]}" -g "$RESOURCE_GROUP" --app "$FUNCTION_APP" --workspace "$ws_id" -o none
+    az monitor app-insights component billing update "${SUB[@]}" -g "$RESOURCE_GROUP" --app "$FUNCTION_APP" \
+      --cap "$LOG_DAILY_CAP_GB" -s true -o none
+  else
+    echo "WARNING: no Application Insights component named $FUNCTION_APP; logs aren't capped" >&2
+  fi
+  az monitor diagnostic-settings create "${SUB[@]}" -n kv-audit --resource "$vault_id" --workspace "$ws_id" \
+    --logs '[{"category":"AuditEvent","enabled":true}]' -o none ||
+    echo "WARNING: could not send Key Vault audit events to $LOG_WORKSPACE" >&2
+
   log "Token encryption key (created once, never printed)"
   local tries=0
   trap 'rm -f "$TMP_KEY_FILE"' EXIT

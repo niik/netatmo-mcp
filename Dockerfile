@@ -7,7 +7,7 @@
 #     -e PUBLIC_BASE_URL=https://netatmo-mcp.example.com \
 #     -e TOKEN_KEY=... -e NETATMO_CLIENT_ID=... -e NETATMO_CLIENT_SECRET=... \
 #     netatmo-mcp
-FROM node:22-alpine
+FROM node:26-alpine
 
 # tini as PID 1 forwards SIGTERM so `docker stop` exits promptly.
 RUN apk add --no-cache tini

@@ -1,0 +1,31 @@
+{
+  "name": "netatmo-mcp",
+  "version": "0.1.0",
+  "description": "Remote MCP server for Netatmo weather stations, multi-user via a stateless OAuth proxy",
+  "private": true,
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/niik/netatmo-mcp.git"
+  },
+  "homepage": "https://github.com/niik/netatmo-mcp#readme",
+  "bugs": {
+    "url": "https://github.com/niik/netatmo-mcp/issues"
+  },
+  "type": "module",
+  "main": "src/functions/*.js",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "node src/dev-server.js",
+    "test": "node --test test/*.test.js",
+    "check": "for f in src/*.js src/functions/*.js; do node --check \"$f\" || exit 1; done",
+    "deploy": "bash infra/deploy.sh"
+  },
+  "dependencies": {
+    "@azure/functions": "^4.17.1",
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "zod": "^4.6.7"
+  }
+}

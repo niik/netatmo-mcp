@@ -1,0 +1,83 @@
+name: Deploy
+
+# Every push and PR runs the checks and tests. Pushes to main also deploy the
+# code to the Azure Function app, but only in a repo where
+# infra/setup-github.sh has set the AZURE_* repo variables (forks just test).
+# Azure login uses OIDC with the managed identity that script creates: no
+# secrets, and it can only deploy code to the app.
+#
+# Actions are pinned to commit SHAs (tag in the comment); Dependabot keeps
+# them current (.github/dependabot.yml).
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - run: npm run check
+      - run: npm test
+
+  deploy:
+    needs: check
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && vars.AZURE_CLIENT_ID != ''
+    runs-on: ubuntu-latest
+    concurrency:
+      group: deploy
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+      AZURE_FUNCTION_APP: ${{ vars.AZURE_FUNCTION_APP }}
+    steps:
+      - name: Check repo variables
+        run: |
+          for v in AZURE_SUBSCRIPTION_ID AZURE_RESOURCE_GROUP AZURE_FUNCTION_APP; do
+            if [ -z "${!v}" ]; then
+              echo "::error::Repo variable $v is not set. Re-run infra/setup-github.sh to set it."
+              exit 1
+            fi
+          done
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: Deploy code
+        run: bash infra/deploy.sh --code
+      - name: Smoke test
+        run: |
+          host=$(az rest --method get --query properties.defaultHostName -o tsv \
+            --url "https://management.azure.com/subscriptions/$AZURE_SUBSCRIPTION_ID/resourceGroups/$AZURE_RESOURCE_GROUP/providers/Microsoft.Web/sites/$AZURE_FUNCTION_APP?api-version=2024-04-01")
+          base="https://$host"
+          # OAuth metadata must be served, and /mcp must refuse requests without a token.
+          for i in $(seq 1 12); do
+            meta=$(curl -s -o /dev/null -w '%{http_code}' "$base/.well-known/oauth-protected-resource")
+            mcp=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$base/mcp" -H 'Content-Type: application/json' -d '{}')
+            [ "$meta" = 200 ] && [ "$mcp" = 401 ] && { echo "OK: $base metadata 200, /mcp 401 without a token"; exit 0; }
+            echo "got metadata=$meta mcp=$mcp, retrying..."; sleep 10
+          done
+          exit 1

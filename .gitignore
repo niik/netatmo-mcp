@@ -1,0 +1,6 @@
+node_modules/
+*.log
+.env
+*.zip
+# Your Azure resource names and subscription (copy infra/config.env.example).
+infra/config.env

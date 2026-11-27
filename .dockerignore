@@ -1,0 +1,7 @@
+# Only package*.json and src/ are copied into the image; keep everything else
+# (especially secrets and local config) out of the build context.
+*
+!package.json
+!package-lock.json
+!src/
+src/**/*.test.js

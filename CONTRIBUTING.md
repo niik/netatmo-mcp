@@ -11,7 +11,7 @@ npm run check  # syntax check
 npm run dev    # local server on http://localhost:3000 (see README)
 ```
 
-Node 26 or newer is required. There's no build step and no linter config; match
+Node 26 or newer is required. `package-lock.json` must resolve every package from `https://registry.npmjs.org/` with sha512 hashes (CI checks this); if your npm uses another registry, check the lockfile before committing. There's no build step and no linter config; match
 the style of the surrounding code.
 
 ## Guidelines

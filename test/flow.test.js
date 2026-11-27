@@ -170,27 +170,30 @@ test("MCP: list stations", async () => {
   const t = (await callTool(tokens.access_token, "list_stations")).content[0].text;
   assert.match(t, /# Home/);
   assert.match(t, /Stockholm, SE, altitude 20 m/);
-  // GPS coordinates pinpoint the user's home and are never sent to the model.
+  // GPS coordinates pinpoint the user's home and are never sent to the model;
+  // neither are device MAC addresses (Netatmo's public map links them to GPS).
   assert.doesNotMatch(t, /59\.33|18\.07|lat /);
+  assert.doesNotMatch(t, /([0-9a-f]{2}:){5}/i);
   assert.match(t, /\*\*Rain gauge\*\*: Rain gauge/);
 });
 
-test("MCP: measurements page through Netatmo's 1024-point limit", async () => {
+test("MCP: measurements page through Netatmo's 1024-point limit, at most 2 pages", async () => {
   const before = fake.calls.filter((c) => c.path === "/api/getmeasure").length;
   const r = await callTool(tokens.access_token, "get_measurements", {
     module: "outdoor",
     start: "2026-01-01",
     end: "2026-02-15",
     scale: "30min",
-    max_points: 2500,
+    max_points: 2048,
     include_series: false,
   });
   const t = r.content[0].text;
   assert.ok(!r.isError, t);
   assert.match(t, /2026-01-01 00:00 → 2026-02-15 23:59 \(Europe\/Stockholm\)/);
-  assert.match(t, /2208 points/); // 46 days × 48
+  assert.match(t, /2048 points/); // of 2208 (46 days × 48)
+  assert.match(t, /Cut at 2048 points/);
   const calls = fake.calls.filter((c) => c.path === "/api/getmeasure").slice(before);
-  assert.equal(calls.length, 3);
+  assert.equal(calls.length, 2);
   assert.equal(calls[0].query.module_id, "02:00:00:00:00:01");
   assert.match(t, /Temperature: min .* max .* mean/);
 });

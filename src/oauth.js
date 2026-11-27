@@ -19,23 +19,29 @@
 // Netatmo app, so that screen can't tell clients apart; the exact redirect URI
 // allowlist and ALLOWED_NETATMO_USERS limit what that exposes.
 
-import { baseUrl, config, NETATMO_SCOPE } from "./config.js";
+import { baseUrl, config, NETATMO_SCOPE, normalizeEmail } from "./config.js";
 import { fingerprint, pkceMatches, randomToken, seal, unseal } from "./crypto.js";
-import { exchangeCode, netatmoAuthorizeUrl, NetatmoClient, NetatmoError, refreshTokens } from "./netatmo.js";
+import { exchangeCode, netatmoAuthorizeUrl, NetatmoClient, refreshTokens } from "./netatmo.js";
 
 const FLOW_TTL = 15 * 60; // Netatmo sign-in must finish within 15 minutes
 const CODE_TTL = 5 * 60;
+// Refresh tokens expire after this long unused (each refresh issues a new one).
+export const REFRESH_TTL = 90 * 24 * 3600;
 const COOKIE_PREFIX = "nmcp_";
 // Netatmo access tokens live 3 h; ours expires a little earlier so the client
 // refreshes before Netatmo starts rejecting it.
 const ACCESS_MARGIN = 120;
 const MAX_URI_LENGTH = 2048;
+// Keeps the sealed client_id well under unseal()'s 16 KB limit.
+const MAX_REDIRECT_URIS_TOTAL = 8192;
 
 export const CORS_HEADERS = {
   "access-control-allow-origin": "*",
   "access-control-allow-methods": "GET, POST, OPTIONS",
   "access-control-allow-headers": "authorization, content-type, mcp-protocol-version, mcp-session-id",
   "access-control-expose-headers": "www-authenticate, mcp-session-id",
+  // Each preflight is a billed invocation; let browsers cache them.
+  "access-control-max-age": "7200",
 };
 
 export const json = (status, body, headers = {}) =>
@@ -83,7 +89,10 @@ function withParams(uri, params) {
 }
 
 // One cookie per sign-in, named after its nonce, so parallel sign-ins don't clash.
-const cookieName = (nonce) => `${COOKIE_PREFIX}${fingerprint(nonce).slice(0, 10)}`;
+// Over https the __Host- prefix pins it to this exact host (no cookie tossing
+// from sibling subdomains such as other *.azurewebsites.net apps).
+const cookieName = (nonce, iss) =>
+  `${iss.startsWith("https:") ? "__Host-" : ""}${COOKIE_PREFIX}${fingerprint(nonce).slice(0, 10)}`;
 
 function cookie(request, name) {
   for (const part of (request.headers.get("cookie") || "").split(";")) {
@@ -152,11 +161,11 @@ function parseUri(uri) {
   }
 }
 
-/** Allowed: an exact https URI from the allowlist, or an http(s) loopback URI. */
+/** Allowed: an exact https URI from the allowlist, or an http loopback URI (RFC 8252 §7.3). */
 function redirectUriAllowed(uri) {
   const url = parseUri(uri);
   if (!url) return false;
-  if (LOOPBACK.has(url.hostname)) return url.protocol === "http:" || url.protocol === "https:";
+  if (LOOPBACK.has(url.hostname)) return url.protocol === "http:" && config().allowLoopback;
   return url.protocol === "https:" && config().allowedRedirectUris.includes(uri);
 }
 
@@ -197,11 +206,13 @@ export async function register(request) {
   const uris = meta?.redirect_uris;
   if (!Array.isArray(uris) || uris.length === 0 || uris.length > 10 || !uris.every((u) => typeof u === "string"))
     return oauthError(400, "invalid_redirect_uri", "redirect_uris must be a non-empty array of URLs");
+  if (uris.reduce((n, u) => n + u.length, 0) > MAX_REDIRECT_URIS_TOTAL)
+    return oauthError(400, "invalid_redirect_uri", "redirect_uris are too long");
   if (!uris.every(redirectUriAllowed))
     return oauthError(
       400,
       "invalid_redirect_uri",
-      "Redirect URI not allowed. This server accepts Claude's callback and loopback URIs; the operator can allow more with ALLOWED_REDIRECT_URIS.",
+      "Redirect URI not allowed. This server accepts Claude's callback and http loopback URIs; the operator can allow more with ALLOWED_REDIRECT_URIS.",
     );
 
   const name = typeof meta.client_name === "string" ? meta.client_name.replace(/[\u0000-\u001f\u007f]/g, "").slice(0, 100) : undefined;
@@ -246,7 +257,7 @@ export function authorize(request) {
   const fl = { ru: redirectUri, cs: p.get("state") ?? undefined, cc: challenge, cid: fingerprint(clientId), nn: nonce };
   const secure = iss.startsWith("https:") ? "; Secure" : "";
   // SameSite=Lax: sent on the top-level redirect back from Netatmo.
-  const setCookie = `${cookieName(nonce)}=${nonce}; Path=/; Max-Age=${FLOW_TTL}; HttpOnly; SameSite=Lax${secure}`;
+  const setCookie = `${cookieName(nonce, iss)}=${nonce}; Path=/; Max-Age=${FLOW_TTL}; HttpOnly; SameSite=Lax${secure}`;
   const state = seal("state", fl, FLOW_TTL);
   return redirect(netatmoAuthorizeUrl({ redirectUri: `${iss}/callback`, state }), { "set-cookie": setCookie });
 }
@@ -257,12 +268,13 @@ export function callback(request) {
   const p = new URL(request.url).searchParams;
   const st = unseal("state", p.get("state"));
   if (!st) return htmlError(400, "The sign-in link expired or is invalid.");
+  const iss = baseUrl(request);
   // Bind the flow to the browser that started it (prevents login CSRF).
-  if (cookie(request, cookieName(st.nn)) !== st.nn)
+  if (cookie(request, cookieName(st.nn, iss)) !== st.nn)
     return htmlError(400, "This sign-in was started in another browser or has already been used.");
 
-  const clear = { "set-cookie": `${cookieName(st.nn)}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax` };
-  const iss = baseUrl(request);
+  const secure = iss.startsWith("https:") ? "; Secure" : "";
+  const clear = { "set-cookie": `${cookieName(st.nn, iss)}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax${secure}` };
   const error = p.get("error");
   if (error) {
     const denied = error === "access_denied";
@@ -289,23 +301,30 @@ async function formParams(request) {
   return new URLSearchParams(await request.text());
 }
 
+/** The Netatmo account's email, normalized (see normalizeEmail), or "" if none. */
+async function accountEmail(accessToken) {
+  const body = await new NetatmoClient(accessToken).getStationsData();
+  return normalizeEmail(body?.user?.mail);
+}
+
 /**
  * With ALLOWED_NETATMO_USERS set, only those Netatmo accounts may use this
- * deployment. Checked whenever tokens are issued (sign-in and every refresh),
- * so removing someone takes effect within one access-token lifetime.
+ * deployment. The email is looked up at sign-in and sealed into the refresh
+ * token, so every refresh re-checks it against the current list before
+ * calling Netatmo: removing someone takes effect within one access-token
+ * lifetime, and a failed lookup can't discard a refresh token Netatmo has
+ * already rotated.
  */
-async function userAllowed(netatmo) {
-  const allowed = config().allowedUsers;
-  if (!allowed.length) return true;
-  const body = await new NetatmoClient(netatmo.accessToken).getStationsData();
-  const mail = String(body?.user?.mail || "").trim().toLowerCase();
-  return mail !== "" && allowed.includes(mail);
+function emailAllowed(email) {
+  const { any, users, invalid } = config().allowedUsers;
+  if (invalid) console.error("ALLOWED_NETATMO_USERS is malformed (expected comma-separated emails); refusing all sign-ins");
+  return any || (Boolean(email) && users.includes(email));
 }
 
 const NOT_ALLOWED = () =>
   oauthError(400, "invalid_grant", "This Netatmo account isn't allowed to use this server. Ask the server's operator for access.");
 
-function issueTokens(request, netatmo, clientFp, previousRefresh) {
+function issueTokens(request, netatmo, clientFp, email, previousRefresh) {
   const ttl = Math.max(60, netatmo.expiresIn - ACCESS_MARGIN);
   const aud = resourceUrl(request);
   return json(200, {
@@ -313,9 +332,15 @@ function issueTokens(request, netatmo, clientFp, previousRefresh) {
     token_type: "Bearer",
     expires_in: ttl,
     // Netatmo rotates refresh tokens; keep the old one if it ever doesn't.
-    refresh_token: seal("refresh", { t: netatmo.refreshToken ?? previousRefresh, cid: clientFp, aud }),
+    refresh_token: seal("refresh", { t: netatmo.refreshToken ?? previousRefresh, cid: clientFp, aud, m: email }, REFRESH_TTL),
     scope: NETATMO_SCOPE,
   });
+}
+
+// Netatmo's error text stays in the logs; clients get a fixed description.
+function upstreamFailure(what, e) {
+  console.warn(`${what} failed: ${e?.name}: ${e?.message}`);
+  return oauthError(400, "invalid_grant", `Netatmo rejected the ${what}`);
 }
 
 export async function token(request) {
@@ -332,27 +357,44 @@ export async function token(request) {
     if (clientFp !== code.cid) return oauthError(400, "invalid_grant", "Code was issued to another client");
     if (p.get("redirect_uri") !== code.ru) return oauthError(400, "invalid_grant", "redirect_uri does not match");
     if (!pkceMatches(p.get("code_verifier"), code.cc)) return oauthError(400, "invalid_grant", "PKCE verification failed");
+    let netatmo;
     try {
-      const netatmo = await exchangeCode(code.nc, `${baseUrl(request)}/callback`);
-      if (!(await userAllowed(netatmo))) return NOT_ALLOWED();
-      return issueTokens(request, netatmo, code.cid);
-    } catch (e) {
       // Netatmo codes are single-use, so a replayed code fails here.
-      return oauthError(400, "invalid_grant", e instanceof NetatmoError ? e.message : "Code exchange failed");
+      netatmo = await exchangeCode(code.nc, `${baseUrl(request)}/callback`);
+    } catch (e) {
+      return upstreamFailure("authorization code", e);
     }
+    let email;
+    try {
+      email = await accountEmail(netatmo.accessToken);
+    } catch (e) {
+      // Without an allowlist the email is only recorded for later; don't fail sign-in over it.
+      if (!config().allowedUsers.any) return upstreamFailure("account lookup", e);
+    }
+    if (!emailAllowed(email)) return NOT_ALLOWED();
+    return issueTokens(request, netatmo, code.cid, email);
   }
 
   if (grant === "refresh_token") {
     const rt = unseal("refresh", p.get("refresh_token"));
     if (!rt || !rt.t || rt.aud !== resourceUrl(request)) return oauthError(400, "invalid_grant", "Refresh token is invalid");
     if (clientFp !== rt.cid) return oauthError(400, "invalid_grant", "Refresh token was issued to another client");
+    if (rt.m !== undefined && !emailAllowed(rt.m)) return NOT_ALLOWED();
+    let netatmo;
     try {
-      const netatmo = await refreshTokens(rt.t);
-      if (!(await userAllowed(netatmo))) return NOT_ALLOWED();
-      return issueTokens(request, netatmo, rt.cid, rt.t);
+      netatmo = await refreshTokens(rt.t);
     } catch (e) {
-      return oauthError(400, "invalid_grant", e instanceof NetatmoError ? e.message : "Refresh failed");
+      return upstreamFailure("refresh token", e);
     }
+    let email = rt.m;
+    if (email === undefined && !config().allowedUsers.any) {
+      // Refresh tokens from before emails were recorded (or whose sign-in
+      // lookup failed): look it up now. If that fails, keep the session
+      // (Netatmo already rotated its refresh token) and check next time.
+      email = await accountEmail(netatmo.accessToken).catch(() => undefined);
+      if (email !== undefined && !emailAllowed(email)) return NOT_ALLOWED();
+    }
+    return issueTokens(request, netatmo, rt.cid, email, rt.t);
   }
 
   return oauthError(400, "unsupported_grant_type", "Use authorization_code or refresh_token");

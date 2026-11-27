@@ -16,26 +16,41 @@ export class NetatmoError extends Error {
   }
 }
 
+// Upstream calls give up after this long (a hung Netatmo would otherwise hold
+// a billed function invocation for minutes).
+const timeoutMs = () => Number(process.env.NETATMO_TIMEOUT_MS) || 10_000;
+
+async function netatmoFetch(url, init) {
+  try {
+    return await fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs()) });
+  } catch (e) {
+    if (e?.name === "TimeoutError" || e?.name === "AbortError") throw new NetatmoError("Netatmo did not respond in time");
+    throw new NetatmoError("Couldn't reach Netatmo");
+  }
+}
+
+// Non-JSON bodies (proxy/CDN error pages) are dropped, not passed on.
 async function readJson(res) {
   const text = await res.text();
   try {
-    return text ? JSON.parse(text) : {};
+    const body = text ? JSON.parse(text) : {};
+    return body && typeof body === "object" ? body : {};
   } catch {
-    return { raw: text.slice(0, 200) };
+    return {};
   }
 }
 
 async function tokenRequest(params) {
   const { netatmoBase, clientId, clientSecret } = config();
   if (!clientId || !clientSecret) throw new NetatmoError("Netatmo app credentials are not configured on the server");
-  const res = await fetch(`${netatmoBase}/oauth2/token`, {
+  const res = await netatmoFetch(`${netatmoBase}/oauth2/token`, {
     method: "POST",
     headers: { "content-type": "application/x-www-form-urlencoded;charset=UTF-8" },
     body: new URLSearchParams({ ...params, client_id: clientId, client_secret: clientSecret }),
   });
   const body = await readJson(res);
   if (!res.ok || !body.access_token) {
-    const msg = body.error_description || body.error || `HTTP ${res.status}`;
+    const msg = String(body.error_description || body.error || `HTTP ${res.status}`).slice(0, 200);
     throw new NetatmoError(`Netatmo token request failed: ${msg}`, { status: res.status });
   }
   return {
@@ -67,11 +82,12 @@ export class NetatmoClient {
   async get(path, params = {}) {
     const url = new URL(`${config().netatmoBase}/api/${path}`);
     for (const [k, v] of Object.entries(params)) if (v !== undefined && v !== null) url.searchParams.set(k, String(v));
-    const res = await fetch(url, { headers: { authorization: `Bearer ${this.accessToken}` } });
+    const res = await netatmoFetch(url, { headers: { authorization: `Bearer ${this.accessToken}` } });
     const body = await readJson(res);
     if (!res.ok || body.error) {
       const err = body.error || {};
-      throw new NetatmoError(`Netatmo API error: ${err.message || body.raw || `HTTP ${res.status}`}`, {
+      const detail = typeof err.message === "string" ? err.message.slice(0, 200) : `HTTP ${res.status}`;
+      throw new NetatmoError(`Netatmo API error: ${detail}`, {
         status: res.status,
         code: err.code,
       });

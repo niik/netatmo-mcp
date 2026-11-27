@@ -29,7 +29,7 @@ A remote [MCP](https://modelcontextprotocol.io) server that lets AI assistants s
 | Tool | What it does |
 | --- | --- |
 | `get_current_weather` | Latest readings from every module: indoor/outdoor temperature (with today's high/low and trend), humidity, CO₂, noise, pressure, rain (latest, last hour, today), wind and gusts, plus battery and signal. Arg: `station`. |
-| `get_measurements` | History for one module with a summary (min/max with time, mean, rain totals) and a data table. Args: `module` (`outdoor`, `indoor`, `rain`, `wind`, a name or id), `start`/`end` (`YYYY-MM-DD` or ISO, station time), `scale` (`max`, `30min`, `1hour`, `3hours`, `1day`, `1week`, `1month`; picked automatically if omitted), `types`, `max_points`, `include_series`. Pages through Netatmo's 1024-point limit. |
+| `get_measurements` | History for one module with a summary (min/max with time, mean, rain totals) and a data table. Args: `module` (`outdoor`, `indoor`, `rain`, `wind`, a name or id), `start`/`end` (`YYYY-MM-DD` or ISO, station time), `scale` (`max`, `30min`, `1hour`, `3hours`, `1day`, `1week`, `1month`; picked automatically if omitted), `types`, `max_points` (up to 2048), `include_series`. Pages through Netatmo's 1024-point limit (at most 2 pages per call). |
 | `list_stations` | Stations with city/country, altitude and time zone (never GPS coordinates), and every module with its id, data types, battery, signal and last-seen time. |
 
 Values are metric (°C, mm, km/h, mbar) and times are in the station's time zone. Ask things like "how cold did it get last night?" or "how much rain fell this month compared to last?".
@@ -48,13 +48,13 @@ Client ─ POST /token ─────────────▶ PKCE check, Ne
 Client ─ POST /mcp (Bearer) ──────▶ unseal → call Netatmo as that user
 ```
 
-"Sealed" means AES-256-GCM encrypted with a key derived from the server's `TOKEN_KEY` secret, with a separate key per purpose so one kind of token can't be used as another. Short-lived values (state, codes, access tokens) carry an expiry, and access and refresh tokens are bound to this server's `/mcp` URL (their audience). Netatmo access tokens last 3 hours, and the client refreshes them through `/token`.
+"Sealed" means AES-256-GCM encrypted with a key derived from the server's `TOKEN_KEY` secret, with a separate key per purpose so one kind of token can't be used as another. Short-lived values (state, codes, access tokens) carry an expiry, refresh tokens expire after 90 days without use (each refresh issues a new one), and access and refresh tokens are bound to this server's `/mcp` URL (their audience). Netatmo access tokens last 3 hours, and the client refreshes them through `/token`.
 
-- **Redirect URIs** must exactly match Claude's callbacks (`https://claude.ai/api/mcp/auth_callback`, `https://claude.com/api/mcp/auth_callback`) or be a loopback URI (`localhost`, `127.0.0.1`, `[::1]`, any port). Add other clients' exact callback URIs with `ALLOWED_REDIRECT_URIS`.
+- **Redirect URIs** must exactly match Claude's callbacks (`https://claude.ai/api/mcp/auth_callback`, `https://claude.com/api/mcp/auth_callback`) or be an `http` loopback URI (`localhost`, `127.0.0.1`, `[::1]`, any port, as RFC 8252 describes for desktop apps such as Claude Code). Add other clients' exact callback URIs with `ALLOWED_REDIRECT_URIS`; set `ALLOW_LOOPBACK_REDIRECTS=false` if only web clients such as claude.ai use your deployment.
 - **Consent happens at Netatmo.** There's no extra consent page on this server: `/authorize` goes straight to Netatmo's sign-in and consent screen. Every client shares one Netatmo app, so that screen shows your app's name rather than the client's; the exact redirect URI allowlist above is what limits which clients can receive a sign-in, and `ALLOWED_NETATMO_USERS` limits who can sign in.
 - A short-lived `HttpOnly`, `SameSite=Lax` cookie ties the Netatmo callback to the browser that started the sign-in, which prevents login CSRF.
-- **Key rotation:** set the new key as `TOKEN_KEY` and the old one as `TOKEN_KEY_PREVIOUS`. Both are accepted, so nobody is signed out; remove the old key after a day or so. Replacing `TOKEN_KEY` without that signs everyone out (they just reconnect).
-- Requests are limited to 64 KB, and JSON-RPC batches are refused, so one request can't fan out into many Netatmo calls.
+- **Key rotation:** set the new key as `TOKEN_KEY` and the old one as `TOKEN_KEY_PREVIOUS`. Both are accepted, so active users aren't signed out. Keep the old key for the refresh-token lifetime (90 days) if you don't want idle users to have to reconnect; once it's removed, clients registered under it must also re-add the connector. Replacing `TOKEN_KEY` without that signs everyone out (they just reconnect). `TOKEN_KEY` must be random bytes in base64 (`openssl rand -base64 32`): passphrases are refused, and `/health` reports 500 if the key is missing or invalid.
+- **Limits:** request bodies over 64 KB are refused while they're being read, JSON-RPC batches are refused, one tool call makes at most 3 Netatmo requests, and every Netatmo request times out after 10 seconds.
 
 ## Privacy
 
@@ -62,7 +62,8 @@ Client ─ POST /mcp (Bearer) ──────▶ unseal → call Netatmo as t
 - **The MCP client stores the tokens**, encrypted. They can't be read without the server's `TOKEN_KEY`, and they only work against that server.
 - **Data path:** your MCP client → this server → Netatmo's API (`api.netatmo.com`) and back. Weather data passes through the server's memory for the duration of a request and isn't written anywhere. What the AI assistant does with the results is governed by that assistant's own terms.
 - **Access is read-only.** The `read_station` scope lets the server read weather station data. It can't change settings or reach other Netatmo products such as cameras or thermostats.
-- **Location:** tools report your station's city, country, altitude and time zone, never its GPS coordinates, since those would pinpoint your home in the assistant's context.
+- **Location:** tools report your station's city, country, altitude and time zone, never its GPS coordinates, since those would pinpoint your home in the assistant's context. Device ids are shown as opaque ids rather than Netatmo's MAC addresses, since Netatmo's public weather map pairs a station's MAC with its location.
+- **Names are sanitized.** Station and module names (which the owner of a station shared with you can set) are stripped of markdown, control and invisible Unicode characters before they reach the assistant, and only numbers and known values from other Netatmo fields are passed on.
 - **Logs:** the server only logs unexpected errors (error type and message, no request data or tokens). On Azure these go to Application Insights in your own subscription, along with the platform's standard request telemetry. That telemetry includes request URLs, so the Netatmo callback's one-time authorization code (single-use, short-lived, useless without the app secret) can appear there; set a retention period that suits you.
 - **Whoever runs the server** holds the Netatmo app secret and `TOKEN_KEY`, so they could in principle read the data of anyone who signs in. Use a deployment you run yourself, or one run by someone you trust.
 - To revoke access, remove the connector from your MCP client. Netatmo's account settings may also list the app under connected third-party apps, where you can revoke it.
@@ -92,7 +93,7 @@ Each deployment needs its own Netatmo app, because Netatmo only redirects to the
    - Save.
 4. Note the **client ID** and **client secret**. Keep the secret private.
 
-Netatmo applies rate limits per app and per user. Per Netatmo's docs at the time of writing, the per-user limits are about 50 requests per 10 seconds and 500 requests per hour; check their current documentation. Normal assistant use stays well below that. A long `get_measurements` history can take several requests, since each call returns at most 1024 points.
+Netatmo applies rate limits per app and per user. Per Netatmo's docs at the time of writing, the per-user limits are about 50 requests per 10 seconds and 500 requests per hour; check their current documentation. Normal assistant use stays well below that. A long `get_measurements` history can take several requests, since each call returns at most 1024 points (one `get_measurements` call makes at most 3 Netatmo requests).
 
 ### 2a. Option A: Azure Functions
 
@@ -173,9 +174,10 @@ Store `TOKEN_KEY` somewhere persistent (an env file or your platform's secret st
 | `PUBLIC_BASE_URL` | yes | The public HTTPS origin of the server, e.g. `https://weather-mcp.example.com`, without a path. Used in OAuth metadata, token audiences and the Netatmo redirect URI, so it must match the redirect URI on your Netatmo app. The server refuses to start without it (only `npm run dev` defaults it to `http://localhost:3000`). |
 | `PORT` | no | Port to listen on. Default `3000`. |
 | `HOST` | no | Interface to bind. Default `0.0.0.0` (`npm run dev` binds `127.0.0.1`). |
-| `ALLOWED_REDIRECT_URIS` | no | Comma-separated exact https redirect URIs for MCP clients other than Claude, added to the built-in Claude callbacks. Loopback redirects are always allowed. |
+| `ALLOWED_REDIRECT_URIS` | no | Comma-separated exact https redirect URIs for MCP clients other than Claude, added to the built-in Claude callbacks. |
+| `ALLOW_LOOPBACK_REDIRECTS` | no | `false` refuses `http://localhost`-style redirect URIs (desktop clients such as Claude Code and MCP Inspector). Default `true`. |
 | `TOKEN_KEY_PREVIOUS` | no | The previous `TOKEN_KEY` during a key rotation; tokens sealed with it are still accepted. |
-| `ALLOWED_NETATMO_USERS` | no | Comma-separated Netatmo account emails allowed to sign in. Empty means any Netatmo account. Checked at sign-in and on every token refresh. |
+| `ALLOWED_NETATMO_USERS` | no | Comma-separated Netatmo account emails allowed to sign in. Empty means any Netatmo account; a malformed value (an entry that isn't an email) allows nobody. Checked at sign-in and on every token refresh. |
 
 **Put it behind HTTPS.** The container speaks plain HTTP. Run it behind a reverse proxy that terminates TLS for your domain (for example Caddy, nginx or Traefik, or a platform such as Fly.io, Render, Cloud Run or Azure Container Apps that does it for you) and forward everything to port 3000. MCP clients and Netatmo require HTTPS redirect URIs, and the sign-in cookie is only marked `Secure` when `PUBLIC_BASE_URL` is `https://`. With Caddy, for example:
 

@@ -13,6 +13,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 source infra/lib.sh
+TMP_KEY_FILE=""
 if [ "${1:-}" = "--code" ]; then
   require_config SUBSCRIPTION RESOURCE_GROUP FUNCTION_APP
 else
@@ -43,7 +44,7 @@ provision() {
       --runtime node --runtime-version 26 --instance-memory 512 -o none
   # A low instance cap bounds the cost of a traffic spike (Flex Consumption bills per execution).
   az functionapp scale config set "${SUB[@]}" -g "$RESOURCE_GROUP" -n "$FUNCTION_APP" \
-    --maximum-instance-count "$MAX_INSTANCES" -o none || true
+    --maximum-instance-count "$MAX_INSTANCES" -o none || echo "WARNING: could not set the instance cap to $MAX_INSTANCES" >&2
 
   log "Managed identity + Key Vault access"
   local app_principal me vault_id
@@ -54,19 +55,22 @@ provision() {
     python3 -c 'import base64,json,sys; s=sys.stdin.read().strip(); s+="="*(-len(s)%4); print(json.loads(base64.urlsafe_b64decode(s))["oid"])')
   # The app only reads secrets; you can manage them.
   az role assignment create "${SUB[@]}" --assignee-object-id "$app_principal" --assignee-principal-type ServicePrincipal \
-    --role "Key Vault Secrets User" --scope "$vault_id" -o none 2>/dev/null || true
+    --role "Key Vault Secrets User" --scope "$vault_id" -o none ||
+    echo "WARNING: could not give the app Key Vault Secrets User (already assigned?)" >&2
   az role assignment create "${SUB[@]}" --assignee-object-id "$me" --assignee-principal-type User \
-    --role "Key Vault Secrets Officer" --scope "$vault_id" -o none 2>/dev/null || true
+    --role "Key Vault Secrets Officer" --scope "$vault_id" -o none ||
+    echo "WARNING: could not give you Key Vault Secrets Officer (already assigned?)" >&2
 
   log "Token encryption key (created once, never printed)"
   local tries=0
+  trap 'rm -f "$TMP_KEY_FILE"' EXIT
   until az keyvault secret show "${SUB[@]}" --vault-name "$KEY_VAULT" -n "$TOKEN_KEY_SECRET" -o none 2>/dev/null; do
-    tmp=$(mktemp); chmod 600 "$tmp"
-    openssl rand -base64 32 | tr -d '\n' >"$tmp"
-    if az keyvault secret set "${SUB[@]}" --vault-name "$KEY_VAULT" -n "$TOKEN_KEY_SECRET" --file "$tmp" -o none 2>/dev/null; then
-      rm -f "$tmp"; break
+    TMP_KEY_FILE=$(mktemp); chmod 600 "$TMP_KEY_FILE"
+    openssl rand -base64 32 | tr -d '\n' >"$TMP_KEY_FILE"
+    if az keyvault secret set "${SUB[@]}" --vault-name "$KEY_VAULT" -n "$TOKEN_KEY_SECRET" --file "$TMP_KEY_FILE" -o none 2>/dev/null; then
+      rm -f "$TMP_KEY_FILE"; break
     fi
-    rm -f "$tmp"
+    rm -f "$TMP_KEY_FILE"
     tries=$((tries + 1)); [ $tries -ge 12 ] && { echo "Could not write to Key Vault (RBAC not propagated?)"; exit 1; }
     echo "  waiting for Key Vault role assignment to propagate..."; sleep 15
   done
@@ -104,11 +108,14 @@ provision() {
 deploy_code() {
   log "Building deployment package"
   local build; build=$(mktemp -d)
+  local pkg="$build.zip"
+  # Double quotes: the paths are baked in now, since locals are gone when the trap runs.
+  trap "rm -rf '$build' '$pkg'" EXIT
   mkdir -p "$build/src/functions"
   cp package.json package-lock.json host.json "$build/"
   cp src/*.js "$build/src/"
   cp src/functions/*.js "$build/src/functions/"
-  (cd "$build" && npm ci --omit=dev --ignore-scripts --no-audit --no-fund --silent && zip -qr ../netatmo-mcp.zip .)
+  (cd "$build" && npm ci --omit=dev --ignore-scripts --no-audit --no-fund --silent && rm -f "$pkg" && zip -qr "$pkg" .)
   log "Deploying to $FUNCTION_APP"
   # Flex Consumption "one deploy" with an Entra token (basic-auth publishing stays disabled).
   local host token status
@@ -116,9 +123,8 @@ deploy_code() {
   token=$(az account get-access-token "${SUB[@]}" --query accessToken -o tsv)
   status=$(curl -sS -o /dev/stderr -w '%{http_code}' -X POST \
     -H @<(printf 'Authorization: Bearer %s\n' "$token") -H "Content-Type: application/zip" \
-    --data-binary @"$build/../netatmo-mcp.zip" "https://$host/api/publish?RemoteBuild=false")
+    --data-binary @"$pkg" "https://$host/api/publish?RemoteBuild=false")
   echo; [ "$status" -lt 300 ] || { echo "Deploy failed: HTTP $status"; exit 1; }
-  rm -rf "$build" "$build/../netatmo-mcp.zip"
   log "Done: https://$(site_host Standard)/mcp"
 }
 

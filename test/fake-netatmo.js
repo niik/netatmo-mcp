@@ -31,8 +31,10 @@ export const STATION = {
   ],
 };
 
+// Tests can change `opts` to make the fake misbehave.
 export function startFakeNetatmo() {
   const calls = [];
+  const opts = { mail: "owner@example.com", station: STATION, stationsStatus: 200, apiAuthFail: false, hang: false };
   const server = createServer(async (req, res) => {
     const url = new URL(req.url, "http://x");
     let body = "";
@@ -43,22 +45,26 @@ export function startFakeNetatmo() {
       res.end(JSON.stringify(obj));
     };
 
+    if (opts.hang && url.pathname.startsWith("/api/")) return; // never answers
+
     if (url.pathname === "/oauth2/token") {
       const p = new URLSearchParams(body);
       if (p.get("client_id") !== "app-id" || p.get("client_secret") !== "app-secret") return send(400, { error: "invalid_client" });
       if (p.get("grant_type") === "authorization_code" && p.get("code") === "netatmo-code")
         return send(200, { access_token: "na-access-1", refresh_token: "na-refresh-1", expires_in: 10800, scope: ["read_station"] });
-      if (p.get("grant_type") === "refresh_token" && p.get("refresh_token") === "na-refresh-1")
-        return send(200, { access_token: "na-access-2", refresh_token: "na-refresh-2", expires_in: 10800, scope: ["read_station"] });
+      const n = p.get("grant_type") === "refresh_token" && /^na-refresh-(\d+)$/.exec(p.get("refresh_token") || "")?.[1];
+      if (n) return send(200, { access_token: `na-access-${+n + 1}`, refresh_token: `na-refresh-${+n + 1}`, expires_in: 10800, scope: ["read_station"] });
       return send(400, { error: "invalid_grant" });
     }
 
     const auth = req.headers.authorization;
-    if (url.pathname.startsWith("/api/") && !["Bearer na-access-1", "Bearer na-access-2"].includes(auth))
+    if (url.pathname.startsWith("/api/") && (opts.apiAuthFail || !/^Bearer na-access-\d+$/.test(auth || "")))
       return send(403, { error: { code: 3, message: "Access token expired" } });
 
-    if (url.pathname === "/api/getstationsdata")
-      return send(200, { status: "ok", body: { devices: [STATION], user: { mail: "owner@example.com", administrative: { unit: 0 } } } });
+    if (url.pathname === "/api/getstationsdata") {
+      if (opts.stationsStatus !== 200) return send(opts.stationsStatus, { error: { code: 500, message: "Internal error" } });
+      return send(200, { status: "ok", body: { devices: [opts.station], user: { mail: opts.mail, administrative: { unit: 0 } } } });
+    }
 
     if (url.pathname === "/api/getmeasure") {
       const q = url.searchParams;
@@ -79,6 +85,6 @@ export function startFakeNetatmo() {
     send(404, { error: { code: 404, message: "not found" } });
   });
   return new Promise((resolve) =>
-    server.listen(0, "127.0.0.1", () => resolve({ server, calls, url: `http://127.0.0.1:${server.address().port}` })),
+    server.listen(0, "127.0.0.1", () => resolve({ server, calls, opts, url: `http://127.0.0.1:${server.address().port}` })),
   );
 }

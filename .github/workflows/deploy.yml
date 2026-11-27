@@ -11,6 +11,7 @@ name: Deploy
 
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -20,6 +21,7 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -28,6 +30,16 @@ jobs:
         with:
           node-version: 26
           cache: npm
+      - name: Lockfile only uses the public npm registry
+        run: |
+          if grep -E '"resolved": "' package-lock.json | grep -v '"resolved": "https://registry.npmjs.org/'; then
+            echo "::error::package-lock.json resolves packages from another registry. Regenerate it against https://registry.npmjs.org/."
+            exit 1
+          fi
+          if grep -q '"integrity": "sha1-' package-lock.json; then
+            echo "::error::package-lock.json has sha1 integrity hashes. Regenerate it against https://registry.npmjs.org/."
+            exit 1
+          fi
       - run: npm ci --no-audit --no-fund
       - run: npm run check
       - run: npm test
@@ -36,6 +48,7 @@ jobs:
     needs: check
     if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && vars.AZURE_CLIENT_ID != ''
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     concurrency:
       group: deploy
       cancel-in-progress: false
@@ -75,11 +88,13 @@ jobs:
           host=$(az rest --method get --query properties.defaultHostName -o tsv \
             --url "https://management.azure.com/subscriptions/$AZURE_SUBSCRIPTION_ID/resourceGroups/$AZURE_RESOURCE_GROUP/providers/Microsoft.Web/sites/$AZURE_FUNCTION_APP?api-version=2024-04-01")
           base="https://$host"
-          # OAuth metadata must be served, and /mcp must refuse requests without a token.
+          # The token key must be valid (/health), OAuth metadata must be served,
+          # and /mcp must refuse requests without a token.
           for i in $(seq 1 12); do
+            health=$(curl -s -o /dev/null -w '%{http_code}' "$base/health")
             meta=$(curl -s -o /dev/null -w '%{http_code}' "$base/.well-known/oauth-protected-resource")
             mcp=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$base/mcp" -H 'Content-Type: application/json' -d '{}')
-            [ "$meta" = 200 ] && [ "$mcp" = 401 ] && { echo "OK: metadata 200, /mcp 401 without a token"; exit 0; }
-            echo "got metadata=$meta mcp=$mcp, retrying..."; sleep 10
+            [ "$health" = 200 ] && [ "$meta" = 200 ] && [ "$mcp" = 401 ] && { echo "OK: health 200, metadata 200, /mcp 401 without a token"; exit 0; }
+            echo "got health=$health metadata=$meta mcp=$mcp, retrying..."; sleep 10
           done
           exit 1

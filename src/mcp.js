@@ -12,7 +12,7 @@ import {
   formatModuleStatus,
   formatPlace,
   formatReadings,
-  MODULE_KINDS,
+  kindLabel,
   normalizeStations,
   SCALES,
   unitFor,
@@ -29,7 +29,13 @@ const INSTRUCTIONS =
   "get_measurements for history, trends, records and totals (e.g. rain per day with scale=1day). " +
   "Call list_stations if you need module names or the station's location.";
 
-const MAX_POINTS_CAP = 5000;
+// At most 2 getmeasure pages (+1 getstationsdata) per tool call: Netatmo's
+// rate limits are per user and per app, shared by everyone on a deployment.
+const PAGE_SIZE = 1024;
+const MAX_POINTS_CAP = 2 * PAGE_SIZE;
+const MAX_PAGES = MAX_POINTS_CAP / PAGE_SIZE;
+// Stop paging after this long and return what we have.
+const DEADLINE_MS = 25_000;
 
 export function createServer(netatmoAccessToken) {
   const server = new McpServer(
@@ -43,10 +49,10 @@ export function createServer(netatmoAccessToken) {
     try {
       return text(await fn(args));
     } catch (e) {
-      const msg =
-        e instanceof NetatmoError && e.isAuthError
-          ? "Netatmo rejected the sign-in (token expired or revoked). Reconnect the Netatmo connector and try again."
-          : e.message;
+      const auth = e instanceof NetatmoError && e.isAuthError;
+      // app.js turns this into an HTTP 401 so the client refreshes its token.
+      if (auth) server.netatmoAuthFailed = true;
+      const msg = auth ? "Netatmo rejected the sign-in (token expired or revoked). Reconnect the Netatmo connector and try again." : e.message;
       return { content: [{ type: "text", text: `Error: ${msg}` }], isError: true };
     }
   };
@@ -69,12 +75,12 @@ export function createServer(netatmoAccessToken) {
         .map((s) =>
           [
             `# ${s.name}${s.readOnly ? " (shared with you, read-only)" : ""}`,
-            `Station id: ${s.id}`,
+            `Station id: ${s.publicId}`,
             `Location: ${formatPlace(s)}`,
             "",
             ...s.modules.map(
               (m) =>
-                `- **${m.name}**: ${MODULE_KINDS[m.type]?.label || m.type} · id ${m.id} · measures ${m.dataTypes.join(", ") || "–"}` +
+                `- **${m.name}**: ${kindLabel(m.type)} · id ${m.publicId} · measures ${m.dataTypes.join(", ") || "–"}` +
                 (formatModuleStatus(m, s.tz) ? ` · ${formatModuleStatus(m, s.tz)}` : ""),
             ),
           ].join("\n"),
@@ -91,7 +97,7 @@ export function createServer(netatmoAccessToken) {
         "Latest readings from every module of the user's Netatmo weather station: indoor and outdoor temperature (with today's " +
         "high/low and trend), humidity, CO₂, noise, pressure, rain (latest, last hour, today) and wind/gusts. Readings update about every 10 minutes.",
       inputSchema: {
-        station: z.string().optional().describe("Station name or id. Defaults to the first station."),
+        station: z.string().max(100).optional().describe("Station name or id. Defaults to the first station."),
       },
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
@@ -107,7 +113,7 @@ export function createServer(netatmoAccessToken) {
             ...s.modules.flatMap((m) => {
               const status = formatModuleStatus(m, s.tz);
               return [
-                `\n## ${m.name} (${MODULE_KINDS[m.type]?.label || m.type})`,
+                `\n## ${m.name} (${kindLabel(m.type)})`,
                 ...formatReadings(m, s.tz),
                 ...(status ? [`- Status: ${status}`] : []),
               ];
@@ -131,15 +137,18 @@ export function createServer(netatmoAccessToken) {
       inputSchema: {
         module: z
           .string()
+          .max(100)
           .optional()
           .describe("Module name, id, or kind: 'outdoor', 'indoor', 'rain', 'wind'. Defaults to the outdoor module."),
-        station: z.string().optional().describe("Station name or id, if the user has several."),
+        station: z.string().max(100).optional().describe("Station name or id, if the user has several."),
         start: z
           .string()
+          .max(40)
           .optional()
           .describe("Start: YYYY-MM-DD (start of that day, station time) or ISO 8601 date-time. Defaults to 24 hours before end."),
         end: z
           .string()
+          .max(40)
           .optional()
           .describe("End: YYYY-MM-DD (end of that day, station time) or ISO 8601 date-time. Defaults to now."),
         scale: z
@@ -147,7 +156,8 @@ export function createServer(netatmoAccessToken) {
           .optional()
           .describe("Interval per data point: max (every ~5–10 min), 30min, 1hour, 3hours, 1day, 1week, 1month."),
         types: z
-          .array(z.string())
+          .array(z.string().regex(/^[A-Za-z0-9_]{1,32}$/, "One measurement type per entry, e.g. Temperature"))
+          .max(12)
           .optional()
           .describe(
             "Netatmo measurement types, e.g. Temperature, min_temp, max_temp, date_min_temp, date_max_temp, Humidity, CO2, " +
@@ -182,8 +192,13 @@ export function createServer(netatmoAccessToken) {
       const points = [];
       let cursor = dateBegin;
       let truncated = false;
-      while (cursor <= dateEnd) {
-        const limit = Math.min(1024, max_points - points.length);
+      const deadline = Date.now() + DEADLINE_MS;
+      for (let pageNo = 0; cursor <= dateEnd; pageNo++) {
+        if (pageNo >= MAX_PAGES || Date.now() > deadline) {
+          truncated = true;
+          break;
+        }
+        const limit = Math.min(PAGE_SIZE, max_points - points.length);
         const page = await api.getMeasure({
           deviceId: s.id,
           moduleId: m.id,
@@ -207,7 +222,7 @@ export function createServer(netatmoAccessToken) {
       const when = (t) => formatTime(t, tz, { dateOnly });
       const isDateType = (t) => /^date_/i.test(t);
       const header = [
-        `# ${s.name} – ${m.name} (${MODULE_KINDS[m.type]?.label || m.type})`,
+        `# ${s.name} – ${m.name} (${kindLabel(m.type)})`,
         `Range: ${formatTime(dateBegin, tz)} → ${formatTime(dateEnd, tz)} (${tz}) · scale ${sc} · ${points.length} points`,
         `Units: ${ty.map((t) => `${t}${unitFor(t) ? ` ${unitFor(t)}` : isDateType(t) ? " (local time)" : ""}`).join(", ")}`,
       ];
@@ -246,7 +261,8 @@ export function createServer(netatmoAccessToken) {
       }
 
       const out = [...header, ...summary];
-      if (truncated) out.push("", `⚠️ Cut at ${max_points} points; narrow the range or use a coarser scale for the rest.`);
+      if (truncated)
+        out.push("", `⚠️ Cut at ${points.length} points (ends ${when(points[points.length - 1].time)}); narrow the range or use a coarser scale for the rest.`);
       if (include_series) {
         out.push(
           "",
@@ -258,7 +274,7 @@ export function createServer(netatmoAccessToken) {
               `| ${when(p.time)} | ${ty
                 .map((t, i) => {
                   const v = p.values?.[i];
-                  return v == null ? "–" : isDateType(t) ? formatTime(v, tz) : v;
+                  return typeof v !== "number" || !Number.isFinite(v) ? "–" : isDateType(t) ? formatTime(v, tz) : v;
                 })
                 .join(" | ")} |`,
           ),

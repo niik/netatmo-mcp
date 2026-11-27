@@ -8,22 +8,30 @@
 //
 // Key rotation: set TOKEN_KEY to the new key and TOKEN_KEY_PREVIOUS to the old
 // one. New tokens use TOKEN_KEY; both are accepted when opening, so nobody is
-// signed out. Remove TOKEN_KEY_PREVIOUS once old tokens have been refreshed
-// (access tokens last ~3 h; refresh tokens are re-issued on every refresh).
+// signed out. Keep TOKEN_KEY_PREVIOUS for as long as refresh tokens live (see
+// REFRESH_TTL in oauth.js): an idle user's refresh token sealed with the old
+// key stops working once it is removed.
 
-import { createCipheriv, createDecipheriv, createHash, hkdfSync, randomBytes, timingSafeEqual } from "node:crypto";
+import { createCipheriv, createDecipheriv, createHash, createHmac, hkdfSync, randomBytes, timingSafeEqual } from "node:crypto";
 
 const VERSION = "n1";
 const keyCache = new Map();
 
+// TOKEN_KEY must be random bytes in canonical base64 (`openssl rand -base64 32`).
+// HKDF doesn't stretch keys, so a passphrase would be open to offline guessing
+// (every client_id is a known-plaintext sample); Buffer.from(…, "base64")
+// silently skips invalid characters, so non-canonical input is refused.
 function parseKey(raw, name) {
-  const key = Buffer.from(raw.trim(), "base64");
-  if (key.length < 32) throw new Error(`${name} must be at least 32 bytes, base64-encoded`);
+  const s = raw.trim();
+  const key = Buffer.from(s, "base64");
+  const canonical = key.toString("base64").replace(/=+$/, "") === s.replace(/=+$/, "");
+  if (!canonical || key.length < 32 || new Set(key).size < 16)
+    throw new Error(`${name} must be at least 32 random bytes, base64-encoded (openssl rand -base64 32)`);
   return key;
 }
 
-/** Master keys, newest first. */
-function masterKeys() {
+/** Master keys, newest first. Throws if TOKEN_KEY / TOKEN_KEY_PREVIOUS are missing or invalid. */
+export function masterKeys() {
   const current = (process.env.TOKEN_KEY || "").trim();
   if (!current) throw new Error("TOKEN_KEY is not configured");
   const keys = [parseKey(current, "TOKEN_KEY")];
@@ -68,8 +76,10 @@ function openWith(key, purpose, buf) {
 /** Decrypt a sealed token. Returns null if it is malformed, forged, for another purpose or expired. */
 export function unseal(purpose, token) {
   if (typeof token !== "string" || !token.startsWith(`${VERSION}.`) || token.length > 16384) return null;
-  const buf = Buffer.from(token.slice(VERSION.length + 1), "base64url");
-  if (buf.length < 12 + 16 + 2) return null;
+  const encoded = token.slice(VERSION.length + 1);
+  const buf = Buffer.from(encoded, "base64url");
+  // Only the exact encoding seal() produces, so a token string is a stable identifier.
+  if (buf.length < 12 + 16 + 2 || buf.toString("base64url") !== encoded) return null;
   for (const master of masterKeys()) {
     const pt = openWith(derive(master, purpose), purpose, buf);
     if (!pt) continue;
@@ -95,5 +105,15 @@ export function pkceMatches(verifier, challenge) {
   const b = Buffer.from(challenge);
   return a.length === b.length && timingSafeEqual(a, b);
 }
+
+/**
+ * Opaque, stable stand-in for a Netatmo device id. Those ids are MAC
+ * addresses, and Netatmo's public weather map pairs a station's MAC with its
+ * GPS location, so they aren't shown to clients. Keyed (HMAC with a key
+ * derived from TOKEN_KEY): a plain hash of a MAC with a known vendor prefix
+ * could be reversed by trying all ~16M device suffixes.
+ */
+export const opaqueId = (raw) =>
+  createHmac("sha256", derive(masterKeys()[0], "device-id")).update(String(raw).toLowerCase()).digest("base64url").slice(0, 10);
 
 export const randomToken = (bytes = 16) => randomBytes(bytes).toString("base64url");

@@ -3,6 +3,7 @@
 
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { baseUrl } from "./config.js";
+import { masterKeys } from "./crypto.js";
 import { createServer } from "./mcp.js";
 import {
   authorizationServerMetadata,
@@ -50,6 +51,14 @@ async function handleMcp(request) {
   try {
     await server.connect(transport);
     const res = await transport.handleRequest(new Request(request.url, { method: "POST", headers: request.headers, body: raw }));
+    // Netatmo rejected the token mid-call (revoked/rotated before our expiry):
+    // a 401 makes the client refresh instead of telling the user to reconnect.
+    if (server.netatmoAuthFailed)
+      return json(
+        401,
+        { error: "invalid_token", error_description: "Netatmo rejected the access token" },
+        { "www-authenticate": wwwAuthenticate(request, "invalid_token") },
+      );
     const headers = new Headers(res.headers);
     for (const [k, v] of Object.entries(CORS_HEADERS)) headers.set(k, v);
     // Buffer the body before the server is closed.
@@ -58,6 +67,17 @@ async function handleMcp(request) {
   } finally {
     await server.close().catch(() => {});
   }
+}
+
+// Fails (500) when TOKEN_KEY is missing or invalid, so a broken key shows up
+// in the deploy smoke test instead of as failed sign-ins.
+function health() {
+  try {
+    masterKeys();
+  } catch {
+    return json(500, { ok: false, error: "token_key_invalid" });
+  }
+  return json(200, { ok: true });
 }
 
 const ROUTES = {
@@ -71,7 +91,7 @@ const ROUTES = {
   "/authorize": { GET: authorize },
   "/callback": { GET: callback },
   "/token": { POST: token },
-  "/health": { GET: () => json(200, { ok: true }) },
+  "/health": { GET: health },
   "/": {
     GET: (request) =>
       new Response(`Netatmo MCP server. Add ${baseUrl(request)}/mcp as a remote MCP connector.\n`, {
@@ -80,7 +100,7 @@ const ROUTES = {
   },
 };
 
-const SECURITY_HEADERS = {
+export const SECURITY_HEADERS = {
   "x-content-type-options": "nosniff",
   "strict-transport-security": "max-age=31536000",
 };

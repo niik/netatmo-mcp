@@ -6,7 +6,12 @@
 
 import { createServer } from "node:http";
 import { pathToFileURL } from "node:url";
-import { handle, MAX_BODY_BYTES } from "./app.js";
+import { handle, MAX_BODY_BYTES, SECURITY_HEADERS } from "./app.js";
+import { masterKeys } from "./crypto.js";
+
+const METHODS = new Set(["GET", "POST", "DELETE", "OPTIONS"]);
+const plain = (res, status, body) =>
+  res.writeHead(status, { "content-type": "application/json", "cache-control": "no-store", connection: "close", ...SECURITY_HEADERS }).end(body);
 
 class TooLarge extends Error {}
 
@@ -26,9 +31,12 @@ async function readBody(req) {
 export function listen({ port, host }) {
   const server = createServer(async (req, res) => {
     try {
-      const body = ["GET", "HEAD"].includes(req.method) ? undefined : await readBody(req);
-      const base = process.env.PUBLIC_BASE_URL || `http://${req.headers.host || "localhost"}`;
-      const request = new Request(new URL(req.url, base), {
+      if (!METHODS.has(req.method)) return plain(res, 405, '{"error":"method_not_allowed"}');
+      // Origin-form paths only: "//host/x" or an absolute URL would change the request's origin.
+      if (!req.url.startsWith("/") || req.url.startsWith("//")) return plain(res, 400, '{"error":"bad_request"}');
+      const body = req.method === "GET" ? undefined : await readBody(req);
+      const base = (process.env.PUBLIC_BASE_URL || `http://${req.headers.host || "localhost"}`).replace(/\/+$/, "");
+      const request = new Request(new URL(base + req.url), {
         method: req.method,
         headers: Object.entries(req.headers).flatMap(([k, v]) => (Array.isArray(v) ? v.map((x) => [k, x]) : [[k, v]])),
         body,
@@ -40,13 +48,13 @@ export function listen({ port, host }) {
       res.end(response.body ? Buffer.from(await response.arrayBuffer()) : undefined);
     } catch (e) {
       if (e instanceof TooLarge) {
-        res.writeHead(413, { "content-type": "application/json", connection: "close" }).end('{"error":"request_too_large"}');
+        plain(res, 413, '{"error":"request_too_large"}');
         req.destroy();
         return;
       }
       console.error(`Request failed: ${e?.name}: ${e?.message}`);
-      if (!res.headersSent) res.writeHead(500);
-      res.end();
+      if (!res.headersSent) plain(res, 500, '{"error":"server_error"}');
+      else res.end();
     }
   });
   server.requestTimeout = 30_000;
@@ -57,6 +65,12 @@ export function listen({ port, host }) {
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   if (!process.env.PUBLIC_BASE_URL) {
     console.error("PUBLIC_BASE_URL is required (e.g. https://weather.example.com)");
+    process.exit(1);
+  }
+  try {
+    masterKeys();
+  } catch (e) {
+    console.error(e.message);
     process.exit(1);
   }
   const server = await listen({ port: Number(process.env.PORT) || 3000, host: process.env.HOST || "0.0.0.0" });

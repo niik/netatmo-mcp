@@ -1,5 +1,6 @@
 // Normalizes Netatmo station data and formats it for the tools.
 
+import { opaqueId } from "./crypto.js";
 import { formatTime, isValidTimeZone } from "./time.js";
 
 export const MODULE_KINDS = {
@@ -34,6 +35,13 @@ const UNITS = {
   windangle: "°",
   gustangle: "°",
 };
+/** Human label for a module type; unknown types are cleaned like names. */
+export const kindLabel = (type) => MODULE_KINDS[type]?.label || cleanName(type) || "Module";
+
+// Upstream data types are identifiers like "Temperature" or "sum_rain".
+const TYPE_RE = /^[A-Za-z0-9_]{1,32}$/;
+const dataTypes = (v) => (Array.isArray(v) ? v.filter((t) => typeof t === "string" && TYPE_RE.test(t)) : []);
+
 export const unitFor = (type) => UNITS[String(type).toLowerCase()] ?? "";
 
 /** Flatten getstationsdata into stations, each with its base station as the first module. */
@@ -43,9 +51,10 @@ export function normalizeStations(body) {
     const tz = isValidTimeZone(d.place?.timezone) ? d.place.timezone : "UTC";
     const main = {
       id: d._id,
+      publicId: opaqueId(d._id),
       name: cleanName(d.module_name) || "Indoor",
       type: d.type || "NAMain",
-      dataTypes: d.data_type || [],
+      dataTypes: dataTypes(d.data_type),
       dashboard: d.dashboard_data || null,
       reachable: d.reachable !== false,
       lastSeen: d.last_status_store ?? d.dashboard_data?.time_utc,
@@ -55,9 +64,10 @@ export function normalizeStations(body) {
     };
     const modules = (d.modules || []).map((m) => ({
       id: m._id,
-      name: cleanName(m.module_name) || MODULE_KINDS[m.type]?.label || cleanName(m.type),
+      publicId: opaqueId(m._id),
+      name: cleanName(m.module_name) || kindLabel(m.type),
       type: m.type,
-      dataTypes: m.data_type || [],
+      dataTypes: dataTypes(m.data_type),
       dashboard: m.dashboard_data || null,
       reachable: m.reachable !== false,
       lastSeen: m.last_seen ?? m.last_message ?? m.dashboard_data?.time_utc,
@@ -68,7 +78,8 @@ export function normalizeStations(body) {
     }));
     return {
       id: d._id,
-      name: cleanName(d.home_name || d.station_name || d.module_name) || d._id,
+      publicId: opaqueId(d._id),
+      name: cleanName(d.home_name || d.station_name || d.module_name) || "Weather station",
       tz,
       place: d.place || {},
       readOnly: d.read_only === true,
@@ -79,12 +90,13 @@ export function normalizeStations(body) {
 
 /**
  * Names come from Netatmo users (including owners of stations shared with this
- * user) and end up in the model's context: strip control and markdown
- * characters and cap the length.
+ * user) and end up in the model's context: strip control, format (zero-width,
+ * bidi overrides, Unicode tag characters used to hide text), private-use,
+ * unassigned and markdown characters, and cap the length.
  */
 export const cleanName = (s) =>
   String(s ?? "")
-    .replace(/[\u0000-\u001f\u007f`*_#|<>\[\]()\\]/g, " ")
+    .replace(/[\p{Cc}\p{Cf}\p{Co}\p{Cn}\p{Cs}\p{Zl}\p{Zp}`*_#|<>\[\]()\\]/gu, " ")
     .replace(/\s+/g, " ")
     .trim()
     .slice(0, 60);
@@ -96,7 +108,7 @@ export function findStation(stations, query) {
   if (!query) return stations[0];
   const q = norm(query);
   const hit =
-    stations.find((s) => norm(s.id) === q) ||
+    stations.find((s) => norm(s.publicId) === q || norm(s.id) === q) ||
     stations.find((s) => norm(s.name) === q) ||
     stations.find((s) => norm(s.name).includes(q));
   if (!hit) throw new Error(`No station matches "${query}". Stations: ${stations.map((s) => s.name).join(", ")}.`);
@@ -114,12 +126,12 @@ export function findModule(stations, { station, module }) {
   }
   const q = norm(module);
   const hit =
-    all.find((x) => norm(x.module.id) === q) ||
+    all.find((x) => norm(x.module.publicId) === q || norm(x.module.id) === q) ||
     all.find((x) => norm(x.module.name) === q) ||
     all.find((x) => (MODULE_KINDS[x.module.type]?.aliases || []).includes(q)) ||
     all.find((x) => norm(x.module.name).includes(q));
   if (!hit) {
-    const list = all.map((x) => `${x.module.name} (${MODULE_KINDS[x.module.type]?.label || x.module.type})`).join(", ");
+    const list = all.map((x) => `${x.module.name} (${kindLabel(x.module.type)})`).join(", ");
     throw new Error(`No module matches "${module}". Modules: ${list}.`);
   }
   return hit;
@@ -128,8 +140,12 @@ export function findModule(stations, { station, module }) {
 // ── Formatting ──────────────────────────────────────────────────────────────
 
 const COMPASS = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE", "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"];
-const compass = (deg) => (deg == null || deg < 0 ? "" : ` (${COMPASS[Math.round(deg / 22.5) % 16]})`);
-const num = (v, unit) => (v == null ? null : `${v}${unit ? (unit === "%" || unit === "°" || unit === "°C" ? "" : " ") + unit : ""}`);
+// Only finite numbers and known trend words from upstream reach the output.
+const isNum = (v) => typeof v === "number" && Number.isFinite(v);
+const compass = (deg) => (!isNum(deg) || deg < 0 ? "" : ` (${COMPASS[Math.round(deg / 22.5) % 16]})`);
+const num = (v, unit) => (!isNum(v) ? null : `${v}${unit ? (unit === "%" || unit === "°" || unit === "°C" ? "" : " ") + unit : ""}`);
+const trend = (v) => (/^(up|down|stable)$/.test(v) ? ` (trend: ${v})` : "");
+const angle = (v) => (isNum(v) ? ` from ${v}°${compass(v)}` : "");
 
 function signalLabel(rf) {
   if (rf == null) return null;
@@ -148,26 +164,25 @@ export function formatReadings(m, tz) {
   const lines = [];
   const add = (label, value) => value != null && lines.push(`- ${label}: ${value}`);
 
-  if (d.Temperature != null) {
-    add("Temperature", `${num(d.Temperature, "°C")}${d.temp_trend ? ` (trend: ${d.temp_trend})` : ""}`);
-    if (d.min_temp != null) add("Today's low", `${num(d.min_temp, "°C")} at ${t(d.date_min_temp)}`);
-    if (d.max_temp != null) add("Today's high", `${num(d.max_temp, "°C")} at ${t(d.date_max_temp)}`);
+  if (isNum(d.Temperature)) {
+    add("Temperature", `${num(d.Temperature, "°C")}${trend(d.temp_trend)}`);
+    if (isNum(d.min_temp)) add("Today's low", `${num(d.min_temp, "°C")} at ${t(d.date_min_temp)}`);
+    if (isNum(d.max_temp)) add("Today's high", `${num(d.max_temp, "°C")} at ${t(d.date_max_temp)}`);
   }
   add("Humidity", num(d.Humidity, "%"));
   add("CO₂", num(d.CO2, "ppm"));
   add("Noise", num(d.Noise, "dB"));
-  if (d.Pressure != null)
-    add("Pressure (sea level)", `${num(d.Pressure, "mbar")}${d.pressure_trend ? ` (trend: ${d.pressure_trend})` : ""}`);
+  if (isNum(d.Pressure)) add("Pressure (sea level)", `${num(d.Pressure, "mbar")}${trend(d.pressure_trend)}`);
   add("Absolute pressure", num(d.AbsolutePressure, "mbar"));
 
   add("Rain, latest reading", num(d.Rain, "mm"));
   add("Rain, last hour", num(d.sum_rain_1, "mm"));
   add("Rain, today", num(d.sum_rain_24, "mm"));
 
-  if (d.WindStrength != null) add("Wind", `${num(d.WindStrength, "km/h")} from ${d.WindAngle}°${compass(d.WindAngle)}`);
-  if (d.GustStrength != null) add("Gusts", `${num(d.GustStrength, "km/h")} from ${d.GustAngle}°${compass(d.GustAngle)}`);
-  if (d.max_wind_str != null)
-    add("Today's strongest wind", `${num(d.max_wind_str, "km/h")} from ${d.max_wind_angle}°${compass(d.max_wind_angle)} at ${t(d.date_max_wind_str)}`);
+  if (isNum(d.WindStrength)) add("Wind", `${num(d.WindStrength, "km/h")}${angle(d.WindAngle)}`);
+  if (isNum(d.GustStrength)) add("Gusts", `${num(d.GustStrength, "km/h")}${angle(d.GustAngle)}`);
+  if (isNum(d.max_wind_str))
+    add("Today's strongest wind", `${num(d.max_wind_str, "km/h")}${angle(d.max_wind_angle)} at ${t(d.date_max_wind_str)}`);
 
   add("Measured", t(d.time_utc));
   return lines;
@@ -176,9 +191,9 @@ export function formatReadings(m, tz) {
 export function formatModuleStatus(m, tz) {
   const bits = [];
   if (!m.reachable) bits.push("UNREACHABLE");
-  if (m.battery != null) bits.push(`battery ${m.battery}%`);
-  if (m.rf != null) bits.push(`radio signal ${signalLabel(m.rf)}`);
-  if (m.wifi != null) bits.push(`Wi-Fi ${wifiLabel(m.wifi)}`);
+  if (isNum(m.battery)) bits.push(`battery ${m.battery}%`);
+  if (isNum(m.rf)) bits.push(`radio signal ${signalLabel(m.rf)}`);
+  if (isNum(m.wifi)) bits.push(`Wi-Fi ${wifiLabel(m.wifi)}`);
   if (m.lastSeen) bits.push(`last seen ${formatTime(m.lastSeen, tz)}`);
   return bits.join(", ");
 }
@@ -187,7 +202,7 @@ export function formatModuleStatus(m, tz) {
 export function formatPlace(s) {
   const p = s.place;
   const loc = [p.city, p.country].filter(Boolean).map(cleanName).join(", ");
-  const alt = typeof p.altitude === "number" ? `, altitude ${p.altitude} m` : "";
+  const alt = isNum(p.altitude) ? `, altitude ${p.altitude} m` : "";
   return `${loc || "Unknown location"}${alt}; time zone ${s.tz}`;
 }
 

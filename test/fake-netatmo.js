@@ -58,7 +58,7 @@ export function startFakeNetatmo() {
       return send(403, { error: { code: 3, message: "Access token expired" } });
 
     if (url.pathname === "/api/getstationsdata")
-      return send(200, { status: "ok", body: { devices: [STATION], user: { administrative: { unit: 0 } } } });
+      return send(200, { status: "ok", body: { devices: [STATION], user: { mail: "owner@example.com", administrative: { unit: 0 } } } });
 
     if (url.pathname === "/api/getmeasure") {
       const q = url.searchParams;

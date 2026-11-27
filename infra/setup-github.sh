@@ -5,9 +5,10 @@
 #     than an app registration since the account can't register apps)
 #   - "Website Contributor" on the function app only (enough to deploy code;
 #     no access to Key Vault)
-#   - repo variables AZURE_CLIENT_ID / AZURE_TENANT_ID / AZURE_SUBSCRIPTION_ID
-#     (for azure/login) and AZURE_RESOURCE_GROUP / AZURE_FUNCTION_APP (what to
-#     deploy to), so the workflow doesn't need infra/config.env
+#   - repo variables AZURE_CLIENT_ID / AZURE_TENANT_ID (for azure/login), and
+#     repo SECRETS AZURE_SUBSCRIPTION_ID / AZURE_RESOURCE_GROUP /
+#     AZURE_FUNCTION_APP (what to deploy to). Secrets, so GitHub masks them in
+#     the (public) Actions logs and the server's address isn't published.
 #
 # Safe to re-run, e.g. to add variables introduced by a newer version.
 #
@@ -47,11 +48,15 @@ for i in 1 2 3 4 5 6; do
   echo "  waiting for the identity to propagate..."; sleep 10
 done
 
-echo "==> GitHub repo variables"
+echo "==> GitHub repo variables and secrets"
 tenant=$(az account show --subscription "$SUBSCRIPTION" --query tenantId -o tsv)
 gh variable set AZURE_CLIENT_ID --repo "$GITHUB_REPO" --body "$app_id"
 gh variable set AZURE_TENANT_ID --repo "$GITHUB_REPO" --body "$tenant"
-gh variable set AZURE_SUBSCRIPTION_ID --repo "$GITHUB_REPO" --body "$SUBSCRIPTION"
-gh variable set AZURE_RESOURCE_GROUP --repo "$GITHUB_REPO" --body "$RESOURCE_GROUP"
-gh variable set AZURE_FUNCTION_APP --repo "$GITHUB_REPO" --body "$FUNCTION_APP"
+gh secret set AZURE_SUBSCRIPTION_ID --repo "$GITHUB_REPO" --body "$SUBSCRIPTION"
+gh secret set AZURE_RESOURCE_GROUP --repo "$GITHUB_REPO" --body "$RESOURCE_GROUP"
+gh secret set AZURE_FUNCTION_APP --repo "$GITHUB_REPO" --body "$FUNCTION_APP"
+# Older versions stored these as (unmasked) variables; remove them.
+for v in AZURE_SUBSCRIPTION_ID AZURE_RESOURCE_GROUP AZURE_FUNCTION_APP; do
+  gh variable delete "$v" --repo "$GITHUB_REPO" 2>/dev/null || true
+done
 echo "Done."

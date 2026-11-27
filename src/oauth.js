@@ -20,7 +20,7 @@
 
 import { baseUrl, config, NETATMO_SCOPE } from "./config.js";
 import { fingerprint, pkceMatches, randomToken, seal, unseal } from "./crypto.js";
-import { exchangeCode, netatmoAuthorizeUrl, NetatmoError, refreshTokens } from "./netatmo.js";
+import { exchangeCode, netatmoAuthorizeUrl, NetatmoClient, NetatmoError, refreshTokens } from "./netatmo.js";
 
 const FLOW_TTL = 15 * 60; // consent + Netatmo sign-in must finish within 15 minutes
 const CODE_TTL = 5 * 60;
@@ -329,6 +329,22 @@ async function formParams(request) {
   return new URLSearchParams(await request.text());
 }
 
+/**
+ * With ALLOWED_NETATMO_USERS set, only those Netatmo accounts may use this
+ * deployment. Checked whenever tokens are issued (sign-in and every refresh),
+ * so removing someone takes effect within one access-token lifetime.
+ */
+async function userAllowed(netatmo) {
+  const allowed = config().allowedUsers;
+  if (!allowed.length) return true;
+  const body = await new NetatmoClient(netatmo.accessToken).getStationsData();
+  const mail = String(body?.user?.mail || "").trim().toLowerCase();
+  return mail !== "" && allowed.includes(mail);
+}
+
+const NOT_ALLOWED = () =>
+  oauthError(400, "invalid_grant", "This Netatmo account isn't allowed to use this server. Ask the server's operator for access.");
+
 function issueTokens(request, netatmo, clientFp, previousRefresh) {
   const ttl = Math.max(60, netatmo.expiresIn - ACCESS_MARGIN);
   const aud = resourceUrl(request);
@@ -357,7 +373,9 @@ export async function token(request) {
     if (p.get("redirect_uri") !== code.ru) return oauthError(400, "invalid_grant", "redirect_uri does not match");
     if (!pkceMatches(p.get("code_verifier"), code.cc)) return oauthError(400, "invalid_grant", "PKCE verification failed");
     try {
-      return issueTokens(request, await exchangeCode(code.nc, `${baseUrl(request)}/callback`), code.cid);
+      const netatmo = await exchangeCode(code.nc, `${baseUrl(request)}/callback`);
+      if (!(await userAllowed(netatmo))) return NOT_ALLOWED();
+      return issueTokens(request, netatmo, code.cid);
     } catch (e) {
       // Netatmo codes are single-use, so a replayed code fails here.
       return oauthError(400, "invalid_grant", e instanceof NetatmoError ? e.message : "Code exchange failed");
@@ -369,7 +387,9 @@ export async function token(request) {
     if (!rt || !rt.t || rt.aud !== resourceUrl(request)) return oauthError(400, "invalid_grant", "Refresh token is invalid");
     if (clientFp !== rt.cid) return oauthError(400, "invalid_grant", "Refresh token was issued to another client");
     try {
-      return issueTokens(request, await refreshTokens(rt.t), rt.cid, rt.t);
+      const netatmo = await refreshTokens(rt.t);
+      if (!(await userAllowed(netatmo))) return NOT_ALLOWED();
+      return issueTokens(request, netatmo, rt.cid, rt.t);
     } catch (e) {
       return oauthError(400, "invalid_grant", e instanceof NetatmoError ? e.message : "Refresh failed");
     }

@@ -41,8 +41,9 @@ provision() {
     az functionapp create "${SUB[@]}" -g "$RESOURCE_GROUP" -n "$FUNCTION_APP" \
       --storage-account "$STORAGE_ACCOUNT" --flexconsumption-location "$LOCATION" \
       --runtime node --runtime-version 22 --instance-memory 512 -o none
+  # A low instance cap bounds the cost of a traffic spike (Flex Consumption bills per execution).
   az functionapp scale config set "${SUB[@]}" -g "$RESOURCE_GROUP" -n "$FUNCTION_APP" \
-    --maximum-instance-count 40 -o none || true
+    --maximum-instance-count "$MAX_INSTANCES" -o none || true
 
   log "Managed identity + Key Vault access"
   local app_principal me vault_id
@@ -78,6 +79,15 @@ provision() {
     az resource update "${SUB[@]}" -g "$RESOURCE_GROUP" --namespace Microsoft.Web --resource-type basicPublishingCredentialsPolicies \
       --parent "sites/$FUNCTION_APP" -n "$policy" --set properties.allow=false -o none
   done
+
+  log "Monthly budget alert: $BUDGET_AMOUNT (billing currency) on $RESOURCE_GROUP"
+  # Emails the subscription's Owners at 80% actual and 100% forecast spend. It alerts only; nothing is stopped.
+  local start body
+  start=$(date -u +%Y-%m-01)
+  body=$(printf '{"properties":{"category":"Cost","amount":%s,"timeGrain":"Monthly","timePeriod":{"startDate":"%sT00:00:00Z"},"notifications":{"actual80":{"enabled":true,"operator":"GreaterThan","threshold":80,"thresholdType":"Actual","contactEmails":[],"contactRoles":["Owner"]},"forecast100":{"enabled":true,"operator":"GreaterThan","threshold":100,"thresholdType":"Forecasted","contactEmails":[],"contactRoles":["Owner"]}}}}' "$BUDGET_AMOUNT" "$start")
+  az rest "${SUB[@]}" --method put -o none --body "$body" \
+    --url "https://management.azure.com/subscriptions/$SUBSCRIPTION/resourceGroups/$RESOURCE_GROUP/providers/Microsoft.Consumption/budgets/netatmo-mcp-monthly?api-version=2023-05-01" ||
+    echo "  (couldn't create the budget; some subscription types don't support budgets)"
 
   log "App settings"
   az functionapp config appsettings set "${SUB[@]}" -g "$RESOURCE_GROUP" -n "$FUNCTION_APP" -o none --settings \

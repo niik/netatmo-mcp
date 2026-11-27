@@ -1,12 +1,12 @@
 # Shared by the scripts in infra/ (sourced, not run). Loads the deployment
 # settings: infra/config.env if it exists, with environment variables taking
 # precedence. The AZURE_* names are accepted as aliases so GitHub Actions can
-# pass its repo variables straight through.
+# pass its repo secrets straight through.
 #
 #   source infra/lib.sh
 #   require_config SUBSCRIPTION RESOURCE_GROUP FUNCTION_APP
 
-CONFIG_VARS="SUBSCRIPTION LOCATION RESOURCE_GROUP STORAGE_ACCOUNT FUNCTION_APP KEY_VAULT TOKEN_KEY_SECRET NETATMO_SECRET_SECRET"
+CONFIG_VARS="SUBSCRIPTION LOCATION RESOURCE_GROUP STORAGE_ACCOUNT FUNCTION_APP KEY_VAULT TOKEN_KEY_SECRET NETATMO_SECRET_SECRET MAX_INSTANCES BUDGET_AMOUNT"
 
 SUBSCRIPTION=${SUBSCRIPTION:-${AZURE_SUBSCRIPTION_ID:-}}
 RESOURCE_GROUP=${RESOURCE_GROUP:-${AZURE_RESOURCE_GROUP:-}}
@@ -26,6 +26,8 @@ unset _v _e
 
 TOKEN_KEY_SECRET=${TOKEN_KEY_SECRET:-token-key}
 NETATMO_SECRET_SECRET=${NETATMO_SECRET_SECRET:-netatmo-client-secret}
+MAX_INSTANCES=${MAX_INSTANCES:-5}
+BUDGET_AMOUNT=${BUDGET_AMOUNT:-50}
 
 # Fail early, with a hint, if a setting is missing or still a placeholder.
 require_config() {

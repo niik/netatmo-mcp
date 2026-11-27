@@ -18,6 +18,7 @@ before(async () => {
     NETATMO_CLIENT_SECRET: "app-secret",
     TOKEN_KEY: randomBytes(32).toString("base64"),
     PUBLIC_BASE_URL: BASE,
+    ALLOWED_NETATMO_USERS: "someone@example.com, Owner@Example.com",
   });
   ({ handle } = await import("../src/app.js"));
 });
@@ -314,5 +315,29 @@ test("PUBLIC_BASE_URL is required outside development", async () => {
     assert.equal(res.status, 500);
   } finally {
     process.env.PUBLIC_BASE_URL = saved;
+  }
+});
+
+test("accounts outside ALLOWED_NETATMO_USERS can't get tokens", async () => {
+  const saved = process.env.ALLOWED_NETATMO_USERS;
+  process.env.ALLOWED_NETATMO_USERS = "someone-else@example.com";
+  try {
+    // Sign in fresh (the fake Netatmo hands out tokens for owner@example.com).
+    const verifier = randomBytes(32).toString("base64url");
+    const challenge = createHash("sha256").update(verifier).digest("base64url");
+    const authz = await req(
+      `/authorize?${new URLSearchParams({ response_type: "code", client_id: clientId, redirect_uri: CLAUDE_REDIRECT, code_challenge: challenge, code_challenge_method: "S256" })}`,
+    );
+    const flow = (await authz.text()).match(/name="flow" value="([^"]+)"/)[1];
+    const cookie = authz.headers.get("set-cookie").split(";")[0];
+    const consent = await req("/authorize", { ...form({ flow, decision: "allow" }), headers: { ...form({}).headers, cookie } });
+    const state = new URL(consent.headers.get("location")).searchParams.get("state");
+    const cb = await req(`/callback?code=netatmo-code&state=${encodeURIComponent(state)}`, { headers: { cookie } });
+    const code = new URL(cb.headers.get("location")).searchParams.get("code");
+    const res = await req("/token", form({ grant_type: "authorization_code", code, code_verifier: verifier, client_id: clientId, redirect_uri: CLAUDE_REDIRECT }));
+    assert.equal(res.status, 400);
+    assert.match((await res.json()).error_description, /isn't allowed/);
+  } finally {
+    process.env.ALLOWED_NETATMO_USERS = saved;
   }
 });

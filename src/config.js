@@ -20,6 +20,8 @@ export function config() {
     clientSecret: (process.env.NETATMO_CLIENT_SECRET || "").trim(),
     publicBaseUrl: (process.env.PUBLIC_BASE_URL || "").trim().replace(/\/+$/, ""),
     allowedRedirectUris: [...DEFAULT_REDIRECT_URIS, ...list(process.env.ALLOWED_REDIRECT_URIS)],
+    // Netatmo account emails allowed to sign in. Empty = any Netatmo account.
+    allowedUsers: list(process.env.ALLOWED_NETATMO_USERS).map((e) => e.toLowerCase()),
   };
 }
 

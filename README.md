@@ -2,7 +2,7 @@
 
 A remote [MCP](https://modelcontextprotocol.io) server that lets AI assistants such as Claude read your [Netatmo Smart Weather Station](https://www.netatmo.com/smart-weather-station): current conditions, history and station details.
 
-- **Multi-user.** One deployment serves anyone with a Netatmo account. Each person signs in with Netatmo from their MCP client and only ever sees their own stations.
+- **Multi-user.** One deployment serves anyone with a Netatmo account, or only the accounts you allow (`ALLOWED_NETATMO_USERS`). Each person signs in with Netatmo from their MCP client and only ever sees their own stations.
 - **Stores nothing.** No database, no sessions, no per-user files. Everything the server needs later is encrypted into the tokens the MCP client keeps.
 - **Read-only.** It asks Netatmo for the `read_station` scope only.
 - **Cheap to host.** Runs on Azure Functions (Flex Consumption) with the included scripts, or in a small Docker container on any host.
@@ -130,15 +130,23 @@ bash infra/set-netatmo-app.sh
 
 It finishes by printing your connector URL, `https://<function-app-host>/mcp`.
 
+**Restrict who can use it (recommended).** By default any Netatmo account can sign in to your deployment, using your Azure resources and your Netatmo app's rate limits (people only ever see their own stations). To allow only specific accounts, enter their Netatmo login emails:
+
+```bash
+bash infra/set-allowed-users.sh
+```
+
+This sets the `ALLOWED_NETATMO_USERS` app setting. Other accounts are refused at sign-in, and an account you remove loses access at its next token refresh (within about 3 hours).
+
 **Optional: deploy from GitHub Actions.** If your copy of the repository is on GitHub:
 
 ```bash
 bash infra/setup-github.sh            # or GITHUB_REPO=owner/name bash infra/setup-github.sh
 ```
 
-This creates a user-assigned managed identity `id-netatmo-mcp-github`, trusted through OIDC for pushes to `main` of your repository, with *Website Contributor* on the function app only (no direct Key Vault access, no secrets stored in GitHub). Note that whoever can push to `main` can deploy code that runs with the app's identity, which can read the secrets: protect the `main` branch, and consider moving the deploy job into a GitHub Environment with required reviewers (then change the federated credential subject to `repo:<owner>/<repo>:environment:<name>`). It sets the repo variables `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID`, `AZURE_RESOURCE_GROUP` and `AZURE_FUNCTION_APP`. From then on every push to `main` runs the tests, deploys and smoke-tests (`.github/workflows/deploy.yml`). Other branches, pull requests and repositories without those variables (such as forks) only run the tests. Re-run the script whenever you need to refresh the variables.
+This creates a user-assigned managed identity `id-netatmo-mcp-github`, trusted through OIDC for pushes to `main` of your repository, with *Website Contributor* on the function app only (no direct Key Vault access, no secrets stored in GitHub). Note that whoever can push to `main` can deploy code that runs with the app's identity, which can read the secrets: protect the `main` branch, and consider moving the deploy job into a GitHub Environment with required reviewers (then change the federated credential subject to `repo:<owner>/<repo>:environment:<name>`). It sets the repo variables `AZURE_CLIENT_ID` and `AZURE_TENANT_ID`, and the repo *secrets* `AZURE_SUBSCRIPTION_ID`, `AZURE_RESOURCE_GROUP` and `AZURE_FUNCTION_APP`. They're secrets so GitHub masks them in the Actions logs, which are public for a public repository: your server's address isn't published there. From then on every push to `main` runs the tests, deploys and smoke-tests (`.github/workflows/deploy.yml`). Other branches, pull requests and repositories without those variables (such as forks) only run the tests. Re-run the script whenever you need to refresh the variables.
 
-**Cost.** For personal or family use, Flex Consumption's free monthly grant usually covers the function executions, leaving a few cents a month for storage, Key Vault operations and Application Insights. That's an estimate, not a promise: check Azure's current pricing, and consider a budget alert on the resource group.
+**Cost.** The function app is capped at `MAX_INSTANCES` instances (default 5), and a monthly budget alert of `BUDGET_AMOUNT` (default 50, in your billing currency) on the resource group emails the subscription's Owners at 80% of actual and 100% of forecast spend. It only alerts; nothing is stopped. For personal or family use, Flex Consumption's free monthly grant usually covers the function executions, leaving a few cents a month for storage, Key Vault operations and Application Insights. That's an estimate, not a promise: check Azure's current pricing, and consider a budget alert on the resource group.
 
 You can override any setting from `infra/config.env` with an environment variable of the same name (`AZURE_SUBSCRIPTION_ID`, `AZURE_RESOURCE_GROUP` and `AZURE_FUNCTION_APP` work too), and `npm run deploy -- --code` redeploys the code without provisioning.
 
@@ -168,6 +176,7 @@ Store `TOKEN_KEY` somewhere persistent (an env file or your platform's secret st
 | `HOST` | no | Interface to bind. Default `0.0.0.0` (`npm run dev` binds `127.0.0.1`). |
 | `ALLOWED_REDIRECT_URIS` | no | Comma-separated exact https redirect URIs for MCP clients other than Claude, added to the built-in Claude callbacks. Loopback redirects are always allowed. |
 | `TOKEN_KEY_PREVIOUS` | no | The previous `TOKEN_KEY` during a key rotation; tokens sealed with it are still accepted. |
+| `ALLOWED_NETATMO_USERS` | no | Comma-separated Netatmo account emails allowed to sign in. Empty means any Netatmo account. Checked at sign-in and on every token refresh. |
 
 **Put it behind HTTPS.** The container speaks plain HTTP. Run it behind a reverse proxy that terminates TLS for your domain (for example Caddy, nginx or Traefik, or a platform such as Fly.io, Render, Cloud Run or Azure Container Apps that does it for you) and forward everything to port 3000. MCP clients and Netatmo require HTTPS redirect URIs, and the sign-in cookie is only marked `Secure` when `PUBLIC_BASE_URL` is `https://`. With Caddy, for example:
 
@@ -231,6 +240,8 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) before sending changes.
 **Everyone was signed out.** `TOKEN_KEY` changed: it was replaced without `TOKEN_KEY_PREVIOUS`, regenerated on container start, or differs between instances. Every token is sealed with it, so all tokens become invalid at once. Reconnect, and keep the key stable (and identical across instances). To rotate without signing anyone out, see [How sign-in works](#how-sign-in-works).
 
 **Requests fail with a server error.** On Azure, look at the function app's logs in Application Insights (Azure portal → the function app → *Application Insights* → *Failures*, or query `traces` and `exceptions` under *Logs*). Check that the app settings `TOKEN_KEY` and `NETATMO_CLIENT_SECRET` show as resolved Key Vault references in the portal (Environment variables). On Docker, run `docker logs netatmo-mcp`.
+
+**Sign-in fails with "This Netatmo account isn't allowed".** The deployment has `ALLOWED_NETATMO_USERS` set and the account isn't on it. Add the account's Netatmo login email (on Azure: `bash infra/set-allowed-users.sh`).
 
 **Rate limited by Netatmo.** Netatmo's per-user and per-app limits apply (see [step 1](#1-create-a-netatmo-app)). Wait a while, and prefer coarser `scale` values for long `get_measurements` ranges.
 

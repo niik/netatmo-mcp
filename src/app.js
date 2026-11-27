@@ -7,7 +7,6 @@ import { createServer } from "./mcp.js";
 import {
   authorizationServerMetadata,
   authorize,
-  authorizeDecision,
   bearerToNetatmo,
   callback,
   CORS_HEADERS,
@@ -69,7 +68,7 @@ const ROUTES = {
   "/.well-known/oauth-authorization-server/mcp": { GET: authorizationServerMetadata },
   "/.well-known/openid-configuration": { GET: authorizationServerMetadata },
   "/register": { POST: register },
-  "/authorize": { GET: authorize, POST: authorizeDecision },
+  "/authorize": { GET: authorize },
   "/callback": { GET: callback },
   "/token": { POST: token },
   "/health": { GET: () => json(200, { ok: true }) },

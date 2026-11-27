@@ -15,7 +15,7 @@
   "type": "module",
   "main": "src/functions/*.js",
   "engines": {
-    "node": ">=22"
+    "node": ">=26"
   },
   "scripts": {
     "dev": "node src/dev-server.js",

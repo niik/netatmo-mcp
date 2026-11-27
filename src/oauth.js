@@ -6,8 +6,7 @@
 // server's Netatmo client secret, so the server proxies the flow:
 //
 //   MCP client ──/register────▶ client_id = sealed {redirect_uris}
-//   MCP client ──GET /authorize▶ checks client + PKCE, sets a nonce cookie and shows a consent page
-//   browser ───POST /authorize▶ checks the cookie, redirects to Netatmo with
+//   MCP client ──GET /authorize▶ checks client + PKCE, sets a nonce cookie and redirects to Netatmo with
 //                                state = sealed {client redirect, PKCE challenge, nonce}
 //   Netatmo ───/callback──────▶ checks state + cookie, redirects to the client with
 //                                code = sealed {Netatmo code, PKCE challenge, ...}
@@ -15,14 +14,16 @@
 //                                access_token = sealed {Netatmo access token}, refresh_token = sealed {Netatmo refresh token}
 //
 // Nothing is stored server-side: every value the server needs later travels
-// inside an encrypted blob (see crypto.js). The consent page is required by
-// the MCP security guidance for proxies that use one static upstream client.
+// inside an encrypted blob (see crypto.js). There is no consent page of our
+// own: Netatmo's consent screen is the only one. Every client shares one
+// Netatmo app, so that screen can't tell clients apart; the exact redirect URI
+// allowlist and ALLOWED_NETATMO_USERS limit what that exposes.
 
 import { baseUrl, config, NETATMO_SCOPE } from "./config.js";
 import { fingerprint, pkceMatches, randomToken, seal, unseal } from "./crypto.js";
 import { exchangeCode, netatmoAuthorizeUrl, NetatmoClient, NetatmoError, refreshTokens } from "./netatmo.js";
 
-const FLOW_TTL = 15 * 60; // consent + Netatmo sign-in must finish within 15 minutes
+const FLOW_TTL = 15 * 60; // Netatmo sign-in must finish within 15 minutes
 const CODE_TTL = 5 * 60;
 const COOKIE_PREFIX = "nmcp_";
 // Netatmo access tokens live 3 h; ours expires a little earlier so the client
@@ -51,7 +52,7 @@ const escapeHtml = (s) =>
 const HTML_HEADERS = {
   "content-type": "text/html; charset=utf-8",
   "cache-control": "no-store",
-  "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'; form-action 'self' https:; frame-ancestors 'none'; base-uri 'none'",
+  "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'; form-action 'none'; frame-ancestors 'none'; base-uri 'none'",
   "referrer-policy": "no-referrer",
   "x-frame-options": "DENY",
 };
@@ -219,7 +220,7 @@ export async function register(request) {
   });
 }
 
-// ── Authorization endpoint: consent page ────────────────────────────────────
+// ── Authorization endpoint ──────────────────────────────────────────────────
 
 export function authorize(request) {
   const p = new URL(request.url).searchParams;
@@ -242,53 +243,12 @@ export function authorize(request) {
   if (!config().clientId) return fail("server_error", "Netatmo app credentials are not configured on the server");
 
   const nonce = randomToken();
-  const flow = seal(
-    "flow",
-    { ru: redirectUri, cs: p.get("state") ?? undefined, cc: challenge, cid: fingerprint(clientId), nn: nonce },
-    FLOW_TTL,
-  );
+  const fl = { ru: redirectUri, cs: p.get("state") ?? undefined, cc: challenge, cid: fingerprint(clientId), nn: nonce };
   const secure = iss.startsWith("https:") ? "; Secure" : "";
-  // SameSite=Lax: sent on the top-level redirect back from Netatmo, but not on
-  // a cross-site POST, so another site can't submit the consent form.
+  // SameSite=Lax: sent on the top-level redirect back from Netatmo.
   const setCookie = `${cookieName(nonce)}=${nonce}; Path=/; Max-Age=${FLOW_TTL}; HttpOnly; SameSite=Lax${secure}`;
-
-  const appName = client.n ? escapeHtml(client.n) : "An MCP client";
-  const target = new URL(redirectUri);
-  const where = LOOPBACK.has(target.hostname) ? "an app on this computer" : escapeHtml(target.host);
-  return page(
-    200,
-    "Connect Netatmo",
-    `<h1 style="font-size:1.3rem">Connect your Netatmo weather station?</h1>
-<p><strong>${appName}</strong> (returning to <strong>${where}</strong>) wants read-only access to your
-Netatmo weather station data: current readings, history and station location.</p>
-<p>You'll sign in at Netatmo next. Only continue if you started this connection yourself.</p>
-<form method="post" action="/authorize" style="display:flex;gap:.75rem;margin-top:1.5rem">
-<input type="hidden" name="flow" value="${escapeHtml(flow)}">
-<button name="decision" value="allow" style="font:inherit;padding:.5rem 1rem">Continue to Netatmo</button>
-<button name="decision" value="deny" style="font:inherit;padding:.5rem 1rem">Cancel</button>
-</form>`,
-    { "set-cookie": setCookie },
-  );
-}
-
-/** Consent form submission: on to Netatmo, or back to the client with access_denied. */
-export async function authorizeDecision(request) {
-  const form = new URLSearchParams(await request.text());
-  const fl = unseal("flow", form.get("flow"));
-  if (!fl) return htmlError(400, "This sign-in expired. Start again from your MCP client.");
-  if (cookie(request, cookieName(fl.nn)) !== fl.nn)
-    return htmlError(400, "This sign-in was started in another browser or has already been used.");
-  const iss = baseUrl(request);
-  if (form.get("decision") !== "allow")
-    return redirect(withParams(fl.ru, { error: "access_denied", error_description: "The user cancelled", state: fl.cs, iss }), {
-      "set-cookie": `${cookieName(fl.nn)}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax`,
-    });
-  const state = seal("state", { ru: fl.ru, cs: fl.cs, cc: fl.cc, cid: fl.cid, nn: fl.nn }, FLOW_TTL);
-  // 303: the browser follows with a GET.
-  return new Response(null, {
-    status: 303,
-    headers: { location: netatmoAuthorizeUrl({ redirectUri: `${iss}/callback`, state }), "cache-control": "no-store" },
-  });
+  const state = seal("state", fl, FLOW_TTL);
+  return redirect(netatmoAuthorizeUrl({ redirectUri: `${iss}/callback`, state }), { "set-cookie": setCookie });
 }
 
 // ── Netatmo redirect back to us ─────────────────────────────────────────────

@@ -41,8 +41,7 @@ The server implements the [MCP authorization spec](https://modelcontextprotocol.
 ```
 Client ─ POST /mcp ───────────────▶ 401, WWW-Authenticate → /.well-known/oauth-protected-resource
 Client ─ POST /register ──────────▶ client_id = sealed{redirect_uris}                    (RFC 7591)
-Client ─ GET  /authorize ─────────▶ consent page ("<client> wants read-only access…"), nonce cookie
-Browser ─ POST /authorize ────────▶ 303 to Netatmo, state = sealed{client redirect, PKCE challenge, nonce}
+Client ─ GET  /authorize ─────────▶ 302 to Netatmo, state = sealed{client redirect, PKCE challenge, nonce}, nonce cookie
 Netatmo ─ GET /callback ──────────▶ 302 to client, code = sealed{Netatmo code, PKCE challenge}
 Client ─ POST /token ─────────────▶ PKCE check, Netatmo code exchange with the app secret,
                                      access_token = sealed{Netatmo access token}, refresh_token = sealed{Netatmo refresh token}
@@ -52,8 +51,8 @@ Client ─ POST /mcp (Bearer) ──────▶ unseal → call Netatmo as t
 "Sealed" means AES-256-GCM encrypted with a key derived from the server's `TOKEN_KEY` secret, with a separate key per purpose so one kind of token can't be used as another. Short-lived values (state, codes, access tokens) carry an expiry, and access and refresh tokens are bound to this server's `/mcp` URL (their audience). Netatmo access tokens last 3 hours, and the client refreshes them through `/token`.
 
 - **Redirect URIs** must exactly match Claude's callbacks (`https://claude.ai/api/mcp/auth_callback`, `https://claude.com/api/mcp/auth_callback`) or be a loopback URI (`localhost`, `127.0.0.1`, `[::1]`, any port). Add other clients' exact callback URIs with `ALLOWED_REDIRECT_URIS`.
-- **A consent page** names the client and where it will return to before you're sent to Netatmo. Every client shares one Netatmo app, so Netatmo's own consent screen can't tell clients apart; this page can.
-- A short-lived `HttpOnly`, `SameSite=Lax` cookie ties the consent form and the Netatmo callback to the browser that started the sign-in, which prevents login CSRF.
+- **Consent happens at Netatmo.** There's no extra consent page on this server: `/authorize` goes straight to Netatmo's sign-in and consent screen. Every client shares one Netatmo app, so that screen shows your app's name rather than the client's; the exact redirect URI allowlist above is what limits which clients can receive a sign-in, and `ALLOWED_NETATMO_USERS` limits who can sign in.
+- A short-lived `HttpOnly`, `SameSite=Lax` cookie ties the Netatmo callback to the browser that started the sign-in, which prevents login CSRF.
 - **Key rotation:** set the new key as `TOKEN_KEY` and the old one as `TOKEN_KEY_PREVIOUS`. Both are accepted, so nobody is signed out; remove the old key after a day or so. Replacing `TOKEN_KEY` without that signs everyone out (they just reconnect).
 - Requests are limited to 64 KB, and JSON-RPC batches are refused, so one request can't fan out into many Netatmo calls.
 
@@ -73,7 +72,7 @@ Client ─ POST /mcp (Bearer) ──────▶ unseal → call Netatmo as t
 You need:
 
 1. A Netatmo account (the one with your weather station is fine) to create a Netatmo app.
-2. A public HTTPS host for the server: Azure Functions with the included scripts (option A), or any machine or platform that runs a Docker container or Node 22 behind HTTPS (option B).
+2. A public HTTPS host for the server: Azure Functions with the included scripts (option A), or any machine or platform that runs a Docker container or Node 26 behind HTTPS (option B).
 
 Each deployment needs its own Netatmo app, because Netatmo only redirects to the URIs registered on the app.
 
@@ -99,7 +98,7 @@ Netatmo applies rate limits per app and per user. Per Netatmo's docs at the time
 
 The scripts in `infra/` provision everything with the Azure CLI and deploy the code. They're idempotent, so you can re-run them.
 
-**Prerequisites:** an Azure subscription, the [Azure CLI](https://learn.microsoft.com/cli/azure/install-azure-cli) (`az login`), Node 22, plus `bash`, `curl`, `zip`, `openssl` and `python3`. For CI you also need the [GitHub CLI](https://cli.github.com/) (`gh auth login`).
+**Prerequisites:** an Azure subscription, the [Azure CLI](https://learn.microsoft.com/cli/azure/install-azure-cli) (`az login`), Node 26, plus `bash`, `curl`, `zip`, `openssl` and `python3`. For CI you also need the [GitHub CLI](https://cli.github.com/) (`gh auth login`).
 
 **Configure.** Copy the example settings and fill in your subscription id and a unique suffix (storage account, Key Vault and function app names are global across Azure):
 
@@ -118,7 +117,7 @@ npm run deploy
 
 This creates, in the resource group from your config:
 
-- a function app (Flex Consumption, Node 22, 512 MB) with a system-assigned managed identity, set to HTTPS only and TLS 1.2+, with FTP and basic-auth publishing turned off,
+- a function app (Flex Consumption, Node 26, 512 MB) with a system-assigned managed identity, set to HTTPS only and TLS 1.2+, with FTP and basic-auth publishing turned off,
 - a Key Vault (RBAC, purge protection on) holding `token-key` (generated, never printed) and later the Netatmo client secret. The app gets *Key Vault Secrets User*; you get *Secrets Officer*.
 - a storage account (required by Functions) and Application Insights.
 
@@ -152,7 +151,7 @@ You can override any setting from `infra/config.env` with an environment variabl
 
 ### 2b. Option B: Docker or any Node host
 
-The `Dockerfile` builds a small image (Node 22 on Alpine, running as a non-root user) that serves the app with the `node:http` entry point, `src/server.js`, on port 3000.
+The `Dockerfile` builds a small image (Node 26 on Alpine, running as a non-root user) that serves the app with the `node:http` entry point, `src/server.js`, on port 3000.
 
 ```bash
 docker build -t netatmo-mcp .

@@ -100,21 +100,11 @@ test("full authorization code flow with PKCE", async () => {
       scope: "read_station",
     })}`,
   );
-  // A consent page comes first, with the flow sealed into the form and a nonce cookie.
-  assert.equal(authz.status, 200);
-  assert.match(authz.headers.get("content-security-policy"), /frame-ancestors 'none'/);
-  const html = await authz.text();
-  assert.match(html, /<strong>Claude<\/strong> \(returning to <strong>claude\.ai<\/strong>\)/);
-  const flow = html.match(/name="flow" value="([^"]+)"/)[1];
+  // Straight on to Netatmo, with a nonce cookie binding the flow to this browser.
+  assert.equal(authz.status, 302);
   const cookie = authz.headers.get("set-cookie").split(";")[0];
   assert.match(authz.headers.get("set-cookie"), /HttpOnly; SameSite=Lax; Secure/);
-
-  // Submitting the consent form without the cookie (e.g. from another site) fails.
-  assert.equal((await req("/authorize", form({ flow, decision: "allow" }))).status, 400);
-
-  const consent = await req("/authorize", { ...form({ flow, decision: "allow" }), headers: { ...form({}).headers, cookie } });
-  assert.equal(consent.status, 303);
-  const netatmoUrl = new URL(consent.headers.get("location"));
+  const netatmoUrl = new URL(authz.headers.get("location"));
   assert.equal(netatmoUrl.origin + netatmoUrl.pathname, `${fake.url}/oauth2/authorize`);
   assert.equal(netatmoUrl.searchParams.get("redirect_uri"), `${BASE}/callback`);
   assert.equal(netatmoUrl.searchParams.get("scope"), "read_station");
@@ -250,19 +240,6 @@ test("forged or wrong-purpose tokens are rejected", async () => {
   assert.equal(swapped.status, 401);
 });
 
-test("cancelling on the consent page returns access_denied to the client", async () => {
-  const authz = await req(
-    `/authorize?${new URLSearchParams({ response_type: "code", client_id: clientId, redirect_uri: CLAUDE_REDIRECT, code_challenge: "a".repeat(43), code_challenge_method: "S256", state: "s1" })}`,
-  );
-  const flow = (await authz.text()).match(/name="flow" value="([^"]+)"/)[1];
-  const cookie = authz.headers.get("set-cookie").split(";")[0];
-  const res = await req("/authorize", { ...form({ flow, decision: "deny" }), headers: { ...form({}).headers, cookie } });
-  assert.equal(res.status, 302);
-  const back = new URL(res.headers.get("location"));
-  assert.equal(back.searchParams.get("error"), "access_denied");
-  assert.equal(back.searchParams.get("state"), "s1");
-});
-
 test("authorize rejects a foreign resource indicator", async () => {
   const res = await req(
     `/authorize?${new URLSearchParams({ response_type: "code", client_id: clientId, redirect_uri: CLAUDE_REDIRECT, code_challenge: "a".repeat(43), code_challenge_method: "S256", resource: "https://evil.example/mcp" })}`,
@@ -328,10 +305,8 @@ test("accounts outside ALLOWED_NETATMO_USERS can't get tokens", async () => {
     const authz = await req(
       `/authorize?${new URLSearchParams({ response_type: "code", client_id: clientId, redirect_uri: CLAUDE_REDIRECT, code_challenge: challenge, code_challenge_method: "S256" })}`,
     );
-    const flow = (await authz.text()).match(/name="flow" value="([^"]+)"/)[1];
     const cookie = authz.headers.get("set-cookie").split(";")[0];
-    const consent = await req("/authorize", { ...form({ flow, decision: "allow" }), headers: { ...form({}).headers, cookie } });
-    const state = new URL(consent.headers.get("location")).searchParams.get("state");
+    const state = new URL(authz.headers.get("location")).searchParams.get("state");
     const cb = await req(`/callback?code=netatmo-code&state=${encodeURIComponent(state)}`, { headers: { cookie } });
     const code = new URL(cb.headers.get("location")).searchParams.get("code");
     const res = await req("/token", form({ grant_type: "authorization_code", code, code_verifier: verifier, client_id: clientId, redirect_uri: CLAUDE_REDIRECT }));

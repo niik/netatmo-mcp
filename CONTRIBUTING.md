@@ -11,7 +11,7 @@ npm run check  # syntax check
 npm run dev    # local server on http://localhost:3000 (see README)
 ```
 
-Node 22 or newer is required. There's no build step and no linter config; match
+Node 26 or newer is required. There's no build step and no linter config; match
 the style of the surrounding code.
 
 ## Guidelines

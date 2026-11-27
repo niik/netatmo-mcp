@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Provision (idempotently) and deploy the Netatmo MCP server to Azure Functions
-# (Flex Consumption, Node 22). Secrets live in Key Vault; the app reads them
+# (Flex Consumption, Node 26). Secrets live in Key Vault; the app reads them
 # through Key Vault references with its managed identity.
 #
 #   npm run deploy            # provision if needed, then deploy code
@@ -36,11 +36,11 @@ provision() {
     az keyvault create "${SUB[@]}" -g "$RESOURCE_GROUP" -n "$KEY_VAULT" -l "$LOCATION" \
       --enable-rbac-authorization true --retention-days 7 --enable-purge-protection true -o none
 
-  log "Function app $FUNCTION_APP (Flex Consumption, Node 22)"
+  log "Function app $FUNCTION_APP (Flex Consumption, Node 26)"
   az functionapp show "${SUB[@]}" -g "$RESOURCE_GROUP" -n "$FUNCTION_APP" -o none 2>/dev/null ||
     az functionapp create "${SUB[@]}" -g "$RESOURCE_GROUP" -n "$FUNCTION_APP" \
       --storage-account "$STORAGE_ACCOUNT" --flexconsumption-location "$LOCATION" \
-      --runtime node --runtime-version 22 --instance-memory 512 -o none
+      --runtime node --runtime-version 26 --instance-memory 512 -o none
   # A low instance cap bounds the cost of a traffic spike (Flex Consumption bills per execution).
   az functionapp scale config set "${SUB[@]}" -g "$RESOURCE_GROUP" -n "$FUNCTION_APP" \
     --maximum-instance-count "$MAX_INSTANCES" -o none || true

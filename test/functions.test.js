@@ -41,8 +41,8 @@ test("register (POST JSON) through the Functions adapter", async () => {
     }),
     ctx,
   );
-  assert.equal(authz.status, 200);
-  assert.match(authz.body, /Continue to Netatmo/);
+  assert.equal(authz.status, 302);
+  assert.match(authz.headers.location, /\/oauth2\/authorize\?/);
   assert.equal(authz.cookies.length, 1);
   assert.match(authz.cookies[0].name, /^nmcp_/);
   assert.equal(authz.cookies[0].httpOnly, true);
